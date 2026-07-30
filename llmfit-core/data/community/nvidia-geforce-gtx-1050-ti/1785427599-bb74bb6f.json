@@ -8,7 +8,7 @@
   "hardware": {
     "hwClass": "DISCRETE_GPU",
     "hardwareName": "NVIDIA GeForce GTX 1050 Ti",
-    "memTierGb": 8,
+    "memTierGb": 4,
     "vramGb": 4.0,
     "gpuCount": 1,
     "unifiedMemory": false,
