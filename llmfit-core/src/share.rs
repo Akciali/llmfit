@@ -320,10 +320,17 @@ fn store_root() -> Option<PathBuf> {
 /// HF-style `org/model` ids from vLLM or MLX, bare file names) passes
 /// through unchanged.
 ///
-/// Splits on both separator kinds, like `tag_matches_model` does: a Windows
-/// path can show up verbatim in the listing.
+/// Only ids that look like absolute paths are stripped (leading `/` or `\\`,
+/// or a Windows drive letter), so Hub-style references such as
+/// `hf.co/org/repo/file.gguf` keep their namespace: they contain separators
+/// and end in `.gguf` but carry nothing machine-specific. Splits on both
+/// separator kinds, like `tag_matches_model` does: a Windows path can show
+/// up verbatim in the listing.
 fn strip_gguf_path(id: &str) -> String {
-    if id.to_ascii_lowercase().ends_with(".gguf") && id.contains(['/', '\\']) {
+    let is_absolute = id.starts_with('/')
+        || id.starts_with('\\')
+        || matches!(id.as_bytes(), [_, b':', b'/' | b'\\', ..]);
+    if is_absolute && id.to_ascii_lowercase().ends_with(".gguf") {
         id.rsplit(['/', '\\']).next().unwrap_or(id).to_string()
     } else {
         id.to_string()
@@ -1477,6 +1484,16 @@ mod tests {
         );
         // Already a bare file name.
         assert_eq!(strip_gguf_path("model.gguf"), "model.gguf");
+        // Hub-style reference: separators and a .gguf suffix, but relative,
+        // so the org and repo context must survive.
+        assert_eq!(
+            strip_gguf_path(
+                "hf.co/bartowski/SmolLM2-135M-Instruct-GGUF/SmolLM2-135M-Instruct-Q4_K_M.gguf"
+            ),
+            "hf.co/bartowski/SmolLM2-135M-Instruct-GGUF/SmolLM2-135M-Instruct-Q4_K_M.gguf"
+        );
+        // Relative filesystem path: nothing machine-specific to hide.
+        assert_eq!(strip_gguf_path("models/foo.gguf"), "models/foo.gguf");
     }
 
     // #819: llama-server reports its `-m` argument, an absolute GGUF path, as
