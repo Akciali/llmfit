@@ -148,7 +148,10 @@ fn build_submission(results: &[BenchResult], specs: &SystemSpecs) -> Submission 
     let results = results
         .iter()
         .map(|r| ResultPayload {
-            model: r.model.clone(),
+            // For the llamacpp provider `r.model` is the id reported by
+            // llama-server, which is usually the absolute path of the loaded
+            // GGUF. Store the bare file name instead (#819).
+            model: strip_gguf_path(&r.model),
             provider: r.provider.clone(),
             num_runs: r.summary.num_runs,
             avg_tps: round2(r.summary.avg_tps),
@@ -308,6 +311,43 @@ fn store_root() -> Option<PathBuf> {
     Some(dirs::data_local_dir()?.join("llmfit").join("benchmarks"))
 }
 
+/// llama-server reports the value of its `-m/--model` argument, usually an
+/// absolute filesystem path to a GGUF, as the model id in its
+/// OpenAI-compatible `/v1/models` listing, and that id ends up verbatim in
+/// `BenchResult::model`. Keep only the file name when the value is a path to
+/// a `.gguf` file, so no machine-specific directory (often a username) leaks
+/// into a stored submission (#819). Every other id shape (Ollama tags,
+/// HF-style `org/model` ids from vLLM or MLX, bare file names) passes
+/// through unchanged.
+///
+/// Splits on both separator kinds, like `tag_matches_model` does: a Windows
+/// path can show up verbatim in the listing.
+fn strip_gguf_path(id: &str) -> String {
+    if id.to_ascii_lowercase().ends_with(".gguf") && id.contains(['/', '\\']) {
+        id.rsplit(['/', '\\']).next().unwrap_or(id).to_string()
+    } else {
+        id.to_string()
+    }
+}
+
+/// Rewrite absolute GGUF paths left in the `model` field of a stored payload.
+/// New payloads are normalised in `build_submission`, but stores written by
+/// older binaries still carry paths (#819). Scrubbing at load time means the
+/// share listing, the `--dry-run` preview and the upload all agree, and no
+/// machine-specific path leaves the machine.
+fn sanitize_stored_payload(payload: &mut Value) {
+    if let Some(results) = payload["results"].as_array_mut() {
+        for r in results {
+            if let Some(model) = r["model"].as_str() {
+                let stripped = strip_gguf_path(model);
+                if stripped != model {
+                    r["model"] = Value::String(stripped);
+                }
+            }
+        }
+    }
+}
+
 fn read_store(subdir: &str) -> Vec<StoredBenchmark> {
     let Some(dir) = store_root().map(|r| r.join(subdir)) else {
         return Vec::new();
@@ -322,8 +362,9 @@ fn read_store(subdir: &str) -> Vec<StoredBenchmark> {
             if path.extension().and_then(|s| s.to_str()) != Some("json") {
                 return None;
             }
-            let payload: Value =
+            let mut payload: Value =
                 serde_json::from_str(&std::fs::read_to_string(&path).ok()?).ok()?;
+            sanitize_stored_payload(&mut payload);
             Some(StoredBenchmark { path, payload })
         })
         .collect();
@@ -1287,6 +1328,24 @@ mod tests {
         );
         assert!(shared_benchmarks().is_empty());
 
+        // #819: a payload written by an older binary can still carry an
+        // absolute GGUF path in `model`. The store scrubs it at load time, so
+        // the listing, the dry-run preview and the upload all see the file
+        // name.
+        let legacy = dir.join("pending").join("1700000000-legacy00.json");
+        std::fs::write(
+            &legacy,
+            r#"{"schemaVersion":1,"results":[{"model":"/home/user/gguf/phi-4-Q4_K_M.gguf","provider":"llamacpp","avgTps":10.0}]}"#,
+        )
+        .unwrap();
+        let with_legacy = pending_benchmarks();
+        assert_eq!(with_legacy.len(), 2);
+        assert_eq!(
+            with_legacy[0].payload["results"][0]["model"],
+            "phi-4-Q4_K_M.gguf"
+        );
+        std::fs::remove_file(&legacy).unwrap();
+
         // The local index resolves the stored run for the matching catalog
         // model (ollama tag "llama3.1:8b" ↔ HF-style name) and outranks
         // nothing else: unknown models get no local measurement.
@@ -1388,5 +1447,53 @@ mod tests {
         assert_eq!(value["hardware"]["hwClass"], "DISCRETE_GPU");
         assert_eq!(value["hardware"]["memTierGb"], 24);
         assert_eq!(value["results"][0]["avgTps"], 128.44);
+    }
+
+    #[test]
+    fn strip_gguf_path_keeps_only_the_file_name_for_gguf_paths() {
+        assert_eq!(
+            strip_gguf_path("/home/user/gguf/SmolLM2-135M-Instruct-Q4_K_M.gguf"),
+            "SmolLM2-135M-Instruct-Q4_K_M.gguf"
+        );
+        assert_eq!(
+            strip_gguf_path(r"C:\models\phi-4-Q4_K_M.GGUF"),
+            "phi-4-Q4_K_M.GGUF"
+        );
+    }
+
+    #[test]
+    fn strip_gguf_path_leaves_non_path_ids_untouched() {
+        // Ollama tag.
+        assert_eq!(strip_gguf_path("llama3.1:8b"), "llama3.1:8b");
+        // HF-style id from vLLM or MLX: contains a slash but is not a file.
+        assert_eq!(
+            strip_gguf_path("meta-llama/Llama-3.1-8B-Instruct"),
+            "meta-llama/Llama-3.1-8B-Instruct"
+        );
+        // GGUF repo id: ends in "GGUF" but not ".gguf".
+        assert_eq!(
+            strip_gguf_path("unsloth/Qwen3-4B-GGUF"),
+            "unsloth/Qwen3-4B-GGUF"
+        );
+        // Already a bare file name.
+        assert_eq!(strip_gguf_path("model.gguf"), "model.gguf");
+    }
+
+    // #819: llama-server reports its `-m` argument, an absolute GGUF path, as
+    // the model id. The stored payload must carry the bare file name, asserted
+    // on the serialised JSON so the whole `build_submission` path is covered,
+    // not just the helper.
+    #[test]
+    fn submission_model_strips_gguf_path_end_to_end() {
+        let mut result = sample_result();
+        result.model = "/home/user/gguf/SmolLM2-135M-Instruct-Q4_K_M.gguf".to_string();
+        result.provider = "llamacpp".to_string();
+        let payload =
+            serde_json::to_value(build_submission(&[result], &specs_with_gpu("GTX 1050 Ti")))
+                .unwrap();
+        assert_eq!(
+            payload["results"][0]["model"],
+            "SmolLM2-135M-Instruct-Q4_K_M.gguf"
+        );
     }
 }
