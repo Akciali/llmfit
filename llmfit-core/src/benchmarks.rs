@@ -355,6 +355,16 @@ pub fn cached_leaderboard_for_preset(label: &str) -> Option<LeaderboardResponse>
     })
 }
 
+/// Number of benchmarks in the embedded cache for a hardware preset label.
+/// Uses the server-reported total from scrape time when present (the cached
+/// rows themselves are capped per preset).
+pub fn cached_preset_benchmark_count(label: &str) -> Option<u64> {
+    embedded_cache()
+        .presets
+        .get(label)
+        .map(|p| p.total.max(p.rows.len() as u64))
+}
+
 /// Returns the scrape timestamp of the embedded cache, if available.
 pub fn cache_timestamp() -> Option<&'static str> {
     embedded_cache().scraped_at.as_deref()
@@ -622,6 +632,24 @@ impl CommunityBenchIndex {
 
 // ── Fetch functions ──────────────────────────────────────────────────
 
+/// GET a benchmark-API URL and parse the JSON response. All API calls go
+/// through here so they share one timeout — without it a black-holed
+/// connection blocks the caller indefinitely.
+fn get_json<T: serde::de::DeserializeOwned>(url: &str, api_key: Option<&str>) -> Result<T, String> {
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(std::time::Duration::from_secs(10)))
+        .build()
+        .into();
+    let mut req = agent.get(url);
+    if let Some(key) = api_key {
+        req = req.header("Authorization", &format!("Bearer {}", key));
+    }
+    let resp = req.call().map_err(|e| format!("HTTP error: {}", e))?;
+    resp.into_body()
+        .read_json()
+        .map_err(|e| format!("JSON parse error: {}", e))
+}
+
 /// Fetch benchmarks matching the user's hardware.
 pub fn fetch_benchmarks(
     specs: &SystemSpecs,
@@ -638,16 +666,7 @@ pub fn fetch_benchmarks(
         .join("&");
 
     let url = format!("{}/benchmarks?{}", BASE_URL, query);
-    let mut req = ureq::get(&url);
-    if let Some(key) = api_key {
-        req = req.header("Authorization", &format!("Bearer {}", key));
-    }
-    let resp = req.call().map_err(|e| format!("HTTP error: {}", e))?;
-    let body: BenchmarkResponse = resp
-        .into_body()
-        .read_json()
-        .map_err(|e| format!("JSON parse error: {}", e))?;
-    Ok(body)
+    get_json(&url, api_key)
 }
 
 /// Fetch benchmarks for a specific model on matching hardware.
@@ -668,16 +687,7 @@ pub fn fetch_benchmarks_for_model(
         .join("&");
 
     let url = format!("{}/benchmarks?{}", BASE_URL, query);
-    let mut req = ureq::get(&url);
-    if let Some(key) = api_key {
-        req = req.header("Authorization", &format!("Bearer {}", key));
-    }
-    let resp = req.call().map_err(|e| format!("HTTP error: {}", e))?;
-    let body: BenchmarkResponse = resp
-        .into_body()
-        .read_json()
-        .map_err(|e| format!("JSON parse error: {}", e))?;
-    Ok(body)
+    get_json(&url, api_key)
 }
 
 /// Fetch the leaderboard filtered to matching hardware.
@@ -696,16 +706,7 @@ pub fn fetch_leaderboard(
         .join("&");
 
     let url = format!("{}/leaderboard?{}", BASE_URL, query);
-    let mut req = ureq::get(&url);
-    if let Some(key) = api_key {
-        req = req.header("Authorization", &format!("Bearer {}", key));
-    }
-    let resp = req.call().map_err(|e| format!("HTTP error: {}", e))?;
-    let body: LeaderboardResponse = resp
-        .into_body()
-        .read_json()
-        .map_err(|e| format!("JSON parse error: {}", e))?;
-    Ok(body)
+    get_json(&url, api_key)
 }
 
 // ── Hardware presets ─────────────────────────────────────────────────
@@ -919,16 +920,7 @@ pub fn fetch_leaderboard_for_preset(
         .join("&");
 
     let url = format!("{}/leaderboard?{}", BASE_URL, query);
-    let mut req = ureq::get(&url);
-    if let Some(key) = api_key {
-        req = req.header("Authorization", &format!("Bearer {}", key));
-    }
-    let resp = req.call().map_err(|e| format!("HTTP error: {}", e))?;
-    let body: LeaderboardResponse = resp
-        .into_body()
-        .read_json()
-        .map_err(|e| format!("JSON parse error: {}", e))?;
-    Ok(body)
+    get_json(&url, api_key)
 }
 
 /// Minimal percent-encoding for query values.

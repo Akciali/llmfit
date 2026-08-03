@@ -1088,6 +1088,10 @@ pub struct App {
     pub bench_tests_done: usize,
     pub bench_tests_total: usize,
     bench_rx: Option<mpsc::Receiver<BenchMsg>>,
+    /// In-flight leaderboard fetch; the HTTP call runs on a worker thread so
+    /// a slow or unreachable API can't freeze the UI.
+    bench_fetch_rx:
+        Option<mpsc::Receiver<Result<llmfit_core::benchmarks::LeaderboardResponse, String>>>,
 
     // Bench-offer modal (benchmark the selected model, optionally share as PR)
     pub bench_offer_state: BenchOfferState,
@@ -1597,6 +1601,7 @@ impl App {
             bench_tests_done: 0,
             bench_tests_total: 0,
             bench_rx: None,
+            bench_fetch_rx: None,
             // Bench-offer modal
             bench_offer_state: BenchOfferState::Offer,
             bench_offer_share: false,
@@ -2521,6 +2526,10 @@ impl App {
             self.bench_cursor = 0;
             self.bench_scroll = 0;
             self.bench_error = None;
+            // Discard any in-flight preset fetch so its rows can't land after
+            // the view has reset to the detected hardware.
+            self.bench_fetch_rx = None;
+            self.bench_loading = false;
         }
     }
 
@@ -2747,17 +2756,49 @@ impl App {
         self.bench_loading = true;
         self.bench_error = None;
 
-        let key = self.bench_api_key.as_deref();
-        match llmfit_core::benchmarks::fetch_leaderboard(&self.specs, key, 100) {
+        let specs = self.specs.clone();
+        let key = self.bench_api_key.clone();
+        let (tx, rx) = mpsc::channel();
+        self.bench_fetch_rx = Some(rx);
+        std::thread::spawn(move || {
+            let _ = tx.send(llmfit_core::benchmarks::fetch_leaderboard(
+                &specs,
+                key.as_deref(),
+                100,
+            ));
+        });
+    }
+
+    /// Drain the in-flight leaderboard fetch. Called every event tick; a no-op
+    /// while the worker is still running or when no fetch is active.
+    pub fn tick_bench_fetch(&mut self) {
+        let Some(rx) = &self.bench_fetch_rx else {
+            return;
+        };
+        let result = match rx.try_recv() {
+            Ok(result) => result,
+            Err(mpsc::TryRecvError::Empty) => return,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.bench_fetch_rx = None;
+                self.bench_loading = false;
+                return;
+            }
+        };
+        self.bench_fetch_rx = None;
+        self.bench_loading = false;
+        match result {
             Ok(resp) => {
                 self.bench_total = resp.total;
                 self.bench_entries = resp.rows;
-                self.bench_loading = false;
             }
             Err(_) => {
-                // API failed — try embedded cache fallback
-                self.bench_loading = false;
-                if let Some(cached) = self.find_cached_for_specs() {
+                // API failed — try embedded cache fallback for whichever view
+                // is current (simulated preset or detected hardware).
+                let cached = match &self.bench_hw_label {
+                    Some(label) => llmfit_core::benchmarks::cached_leaderboard_for_preset(label),
+                    None => self.find_cached_for_specs(),
+                };
+                if let Some(cached) = cached {
                     self.bench_total = cached.total;
                     self.bench_entries = cached.rows;
                     self.bench_error = Some("Using cached data (API unreachable)".to_string());
@@ -2906,30 +2947,16 @@ impl App {
             self.bench_loading = true;
             self.bench_error = None;
 
-            let key = self.bench_api_key.as_deref();
-            match llmfit_core::benchmarks::fetch_leaderboard_for_preset(preset, key, 100) {
-                Ok(resp) => {
-                    self.bench_total = resp.total;
-                    self.bench_entries = resp.rows;
-                    self.bench_loading = false;
-                }
-                Err(_) => {
-                    // API failed — try embedded cache
-                    self.bench_loading = false;
-                    if let Some(cached) =
-                        llmfit_core::benchmarks::cached_leaderboard_for_preset(preset.label)
-                    {
-                        self.bench_total = cached.total;
-                        self.bench_entries = cached.rows;
-                        self.bench_error = Some("Using cached data (API unreachable)".to_string());
-                    } else {
-                        self.bench_error = Some(
-                            "API unreachable and no cached data for this hardware".to_string(),
-                        );
-                    }
-                }
-            }
-            self.merge_local_bench_rows();
+            let key = self.bench_api_key.clone();
+            let (tx, rx) = mpsc::channel();
+            self.bench_fetch_rx = Some(rx);
+            std::thread::spawn(move || {
+                let _ = tx.send(llmfit_core::benchmarks::fetch_leaderboard_for_preset(
+                    preset,
+                    key.as_deref(),
+                    100,
+                ));
+            });
         }
 
         self.bench_cursor = 0;
@@ -5635,6 +5662,45 @@ mod tests {
         }
         app.bench_loading = true; // skip leaderboard fetch in tests
         app
+    }
+
+    #[test]
+    fn tick_bench_fetch_applies_result_and_clears_loading() {
+        let mut app = test_app();
+        let (tx, rx) = mpsc::channel();
+        app.bench_fetch_rx = Some(rx);
+        app.bench_loading = true;
+
+        // Worker still running — tick is a no-op.
+        app.tick_bench_fetch();
+        assert!(app.bench_loading);
+
+        tx.send(Ok(llmfit_core::benchmarks::LeaderboardResponse {
+            rows: Vec::new(),
+            total: 42,
+            limit: 100,
+            offset: 0,
+        }))
+        .unwrap();
+        app.tick_bench_fetch();
+        assert!(!app.bench_loading);
+        assert!(app.bench_fetch_rx.is_none());
+        assert_eq!(app.bench_total, 42);
+    }
+
+    #[test]
+    fn tick_bench_fetch_error_surfaces_without_freezing_state() {
+        let mut app = test_app();
+        let (tx, rx) = mpsc::channel();
+        app.bench_fetch_rx = Some(rx);
+        app.bench_loading = true;
+
+        tx.send(Err("HTTP error: timeout".to_string())).unwrap();
+        app.tick_bench_fetch();
+        assert!(!app.bench_loading);
+        assert!(app.bench_fetch_rx.is_none());
+        // Either the embedded cache or an error message — never stuck loading.
+        assert!(app.bench_error.is_some() || !app.bench_entries.is_empty());
     }
 
     #[test]
