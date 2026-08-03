@@ -4734,7 +4734,8 @@ fn draw_bench_hw_picker(frame: &mut Frame, app: &App, tc: &ThemeColors) {
 
     // +3 for border + "My Hardware" entry + bottom hint
     let popup_height = (presets.len() as u16 + 5).min(area.height.saturating_sub(6));
-    let popup_width = 42u16.min(area.width.saturating_sub(4));
+    // Wide enough for "<label> (NNN benchmarks)" plus marker and check.
+    let popup_width = 52u16.min(area.width.saturating_sub(4));
 
     let x = area.x + (area.width.saturating_sub(popup_width)) / 2;
     let y = area.y + (area.height.saturating_sub(popup_height)) / 2;
@@ -4776,10 +4777,12 @@ fn draw_bench_hw_picker(frame: &mut Frame, app: &App, tc: &ThemeColors) {
             )
         } else {
             let p = &presets[i - 1];
-            (
-                p.label.to_string(),
-                app.bench_hw_label.as_deref() == Some(p.label),
-            )
+            let label = match llmfit_core::benchmarks::cached_preset_benchmark_count(p.label) {
+                Some(1) => format!("{} (1 benchmark)", p.label),
+                Some(n) => format!("{} ({} benchmarks)", p.label, n),
+                None => p.label.to_string(),
+            };
+            (label, app.bench_hw_label.as_deref() == Some(p.label))
         };
 
         let style = if is_selected {
