@@ -1072,7 +1072,11 @@ def scrape_models_parallel(repo_ids: list[str], threads: int) -> tuple[list[dict
 GGUF_PROVIDERS = ["unsloth", "bartowski", "ggml-org", "TheBloke", "mradermacher"]
 
 GGUF_CACHE_FILE = os.path.join(os.path.dirname(__file__), "..", "data", "gguf_sources_cache.json")
-GGUF_CACHE_MAX_AGE_DAYS = 7  # Re-check repos older than this
+# Re-check repos older than this. Must exceed the weekly CI cadence (7 days)
+# or every cached entry is already expired by the next scheduled run and the
+# cache restored in CI is useless; 13 days staggers re-checks across runs
+# (roughly half the entries each week).
+GGUF_CACHE_MAX_AGE_DAYS = 13
 
 
 def _load_gguf_cache() -> dict:
