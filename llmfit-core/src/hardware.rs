@@ -2448,14 +2448,27 @@ fn detect_windows_physical_total_ram_gb() -> Option<f64> {
 pub const WINDOWS_REGISTRY_VRAM_PS_COMMAND: &str = r"Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}\*' -ErrorAction SilentlyContinue | ForEach-Object { $d = $_.DriverDesc; $m = $_.'HardwareInformation.qwMemorySize'; if ($null -eq $m) { $m = $_.'HardwareInformation.MemorySize' }; if ($m -is [byte[]]) { if ($m.Length -ge 8) { $m = [System.BitConverter]::ToUInt64($m, 0) } elseif ($m.Length -ge 4) { $m = [System.BitConverter]::ToUInt32($m, 0) } else { $m = $null } } elseif ($m -is [int] -and $m -lt 0) { $m = [long]$m + 4294967296 }; if ($d -and $m) { $d + '|' + $m } }";
 
 /// Normalize a GPU product name for cross-source comparison: lowercase, with
-/// trademark markers and repeated whitespace removed. WMI and the registry
-/// disagree on these decorations for the same adapter (e.g. "AMD Radeon(TM)
-/// Graphics" vs "AMD Radeon Graphics"), and neither string contains the other.
+/// trademark decoration and punctuation reduced to whitespace, then whitespace
+/// collapsed. WMI and the registry disagree on these decorations for the same
+/// adapter ("AMD Radeon(TM) Graphics" vs "AMD Radeon Graphics"), and neither
+/// string contains the other, so matching has to see through them.
+///
+/// The textual markers are expanded first, because stripping punctuation alone
+/// would turn "(TM)" into a literal "tm" glued to the preceding word. Every
+/// remaining non-alphanumeric character is then dropped, which also covers the
+/// symbol forms: a ™ or ® arrives from PowerShell 5.1 in the console OEM
+/// codepage, so a lossy decode leaves U+FFFD rather than the character itself,
+/// and no amount of marker matching would remove it.
 fn normalize_gpu_name_for_match(name: &str) -> String {
-    name.to_lowercase()
+    let expanded = name
+        .to_lowercase()
         .replace("(tm)", " ")
         .replace("(r)", " ")
-        .replace("(c)", " ")
+        .replace("(c)", " ");
+    expanded
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { ' ' })
+        .collect::<String>()
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
@@ -4957,6 +4970,47 @@ GPU[2]\t\t: GFX Version: \t\tgfx90c
         assert_eq!(
             SystemSpecs::match_registry_vram("AMD Radeon(TM)  Graphics", &registry),
             Some(2147483648)
+        );
+    }
+
+    // The symbol forms of the same decoration. PowerShell 5.1 writes stdout in
+    // the console OEM codepage, so a ™ or ® survives the lossy decode as
+    // U+FFFD; matching must see through the replacement character too, or the
+    // registry override is unreachable for those adapters.
+    #[test]
+    fn test_registry_vram_matches_across_symbol_and_mangled_markers() {
+        let registry = vec![("AMD Radeon Graphics".to_string(), 2147483648u64)];
+        for name in [
+            "AMD Radeon\u{2122} Graphics",
+            "AMD Radeon\u{00ae} Graphics",
+            "AMD Radeon\u{fffd} Graphics",
+            "AMD  Radeon Graphics",
+        ] {
+            assert_eq!(
+                SystemSpecs::match_registry_vram(name, &registry),
+                Some(2147483648),
+                "failed to match {name:?}"
+            );
+        }
+    }
+
+    // Stripping punctuation must not fuse "(TM)" into the preceding word,
+    // which would leave "radeontm graphics" and break the match it exists
+    // to make.
+    #[test]
+    fn test_normalize_gpu_name_expands_markers_before_stripping() {
+        assert_eq!(
+            super::normalize_gpu_name_for_match("AMD Radeon(TM) Graphics"),
+            "amd radeon graphics"
+        );
+        assert_eq!(
+            super::normalize_gpu_name_for_match("Intel(R) Arc(TM) A770 Graphics"),
+            "intel arc a770 graphics"
+        );
+        // Model identity must survive normalization.
+        assert_eq!(
+            super::normalize_gpu_name_for_match("AMD Radeon AI PRO R9700"),
+            "amd radeon ai pro r9700"
         );
     }
 
