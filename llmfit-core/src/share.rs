@@ -343,7 +343,7 @@ fn strip_gguf_path(id: &str) -> String {
 /// share listing, the `--dry-run` preview and the upload all agree, and no
 /// machine-specific path leaves the machine.
 fn sanitize_stored_payload(payload: &mut Value) {
-    if let Some(results) = payload["results"].as_array_mut() {
+    if let Some(results) = payload.get_mut("results").and_then(Value::as_array_mut) {
         for r in results {
             if let Some(model) = r["model"].as_str() {
                 let stripped = strip_gguf_path(model);
@@ -1494,6 +1494,38 @@ mod tests {
         );
         // Relative filesystem path: nothing machine-specific to hide.
         assert_eq!(strip_gguf_path("models/foo.gguf"), "models/foo.gguf");
+    }
+
+    #[test]
+    fn sanitize_stored_payload_scrubs_absolute_model_paths() {
+        let mut payload = json!({
+            "results": [
+                { "model": "/home/alice/models/phi-4-Q4_K_M.gguf" },
+                { "model": "llama3.1:8b" }
+            ]
+        });
+        sanitize_stored_payload(&mut payload);
+        assert_eq!(payload["results"][0]["model"], "phi-4-Q4_K_M.gguf");
+        assert_eq!(payload["results"][1]["model"], "llama3.1:8b");
+    }
+
+    #[test]
+    fn sanitize_stored_payload_ignores_non_object_payloads() {
+        // read_store treats every pending file as untrusted: a hand-edited
+        // file whose top level is not a JSON object must not panic the scrub.
+        for mut payload in [json!("not an object"), json!([1, 2, 3]), Value::Null] {
+            let before = payload.clone();
+            sanitize_stored_payload(&mut payload);
+            assert_eq!(payload, before);
+        }
+    }
+
+    #[test]
+    fn sanitize_stored_payload_leaves_objects_without_results_untouched() {
+        // Indexing through IndexMut would insert a null `results` key here.
+        let mut payload = json!({ "hardware": { "gpuModel": "RTX 2080" } });
+        sanitize_stored_payload(&mut payload);
+        assert_eq!(payload, json!({ "hardware": { "gpuModel": "RTX 2080" } }));
     }
 
     // #819: llama-server reports its `-m` argument, an absolute GGUF path, as
