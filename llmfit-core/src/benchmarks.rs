@@ -277,12 +277,12 @@ pub fn hw_leaderboard_params(specs: &SystemSpecs) -> Vec<(&'static str, String)>
 
     // VRAM tier
     if let Some(vram) = specs.total_gpu_vram_gb {
-        let tier = nearest_mem_tier(vram);
+        let tier = lookup_mem_tier(vram);
         if tier > 0 {
             params.push(("memTier", tier.to_string()));
         }
     } else if specs.unified_memory {
-        let tier = nearest_mem_tier(specs.total_ram_gb);
+        let tier = lookup_mem_tier(specs.total_ram_gb);
         if tier > 0 {
             params.push(("memTier", tier.to_string()));
         }
@@ -301,7 +301,18 @@ pub fn hw_leaderboard_params(specs: &SystemSpecs) -> Vec<(&'static str, String)>
     params
 }
 
-fn nearest_mem_tier(gb: f64) -> u32 {
+/// Bucket a memory size into the tier used as a *lookup key* against the
+/// cached community results.
+///
+/// Nearest-match is the right rule here and the wrong one in `share.rs`: a
+/// lookup wants the closest bucket that has data even when the fit is not
+/// exact, because returning nothing is worse than returning an approximation.
+/// A declared capacity wants the opposite.
+///
+/// That is why this is not the same function as `declared_mem_tier` in
+/// `share.rs` despite looking almost identical, and why the two ladders are
+/// allowed to differ. Please do not unify them.
+fn lookup_mem_tier(gb: f64) -> u32 {
     const TIERS: [u32; 9] = [8, 12, 16, 24, 32, 48, 80, 96, 128];
     let mut best = 0u32;
     let mut best_dist = f64::MAX;
