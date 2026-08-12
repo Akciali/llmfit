@@ -7,7 +7,7 @@
   },
   "hardware": {
     "hwClass": "DISCRETE_GPU",
-    "hardwareName": "Radeon RX 7900 XT/7900 XTX/7900 GRE/7900M",
+    "hardwareName": "AMD Radeon RX 7900 XT",
     "memTierGb": 16,
     "vramGb": 19.98,
     "gpuCount": 1,
