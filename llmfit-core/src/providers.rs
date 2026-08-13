@@ -2,8 +2,10 @@
 //!
 //! Each provider can list locally installed models and pull new ones.
 
+use regex::Regex;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 // ---------------------------------------------------------------------------
 // Provider trait
@@ -3190,6 +3192,34 @@ pub fn strip_gguf_quant_suffix(stem: &str) -> Option<String> {
     None
 }
 
+/// Strip an MLX quantization suffix from a lowercased model stem, so
+/// mlx-community basenames reduce to catalog slugs (#854).
+/// "llama-3.2-1b-instruct-4bit" → "llama-3.2-1b-instruct"
+///
+/// End-anchored, unlike the GGUF list above: mlx-community always places the
+/// quant scheme last, and dtype-like fragments can occur inside genuine model
+/// names. Covers `-<N>bit` with optional trailing variant markers
+/// (`-4bit-dwq`, date-stamped `-4bit-dwq-05082025`) and the compound schemes
+/// `-mxfp4-q4`, `-mxfp4` and `-fp16`, stripped as whole units.
+pub fn strip_mlx_quant_suffix(stem: &str) -> Option<String> {
+    for pat in ["-mxfp4-q4", "-mxfp4", "-fp16"] {
+        if let Some(base) = stem.strip_suffix(pat)
+            && !base.is_empty()
+        {
+            return Some(base.to_string());
+        }
+    }
+    static MLX_BIT_SUFFIX: OnceLock<Regex> = OnceLock::new();
+    let re = MLX_BIT_SUFFIX
+        .get_or_init(|| Regex::new(r"-\d+bit(?:-[a-z0-9]+)*$").expect("valid MLX suffix regex"));
+    if let Some(m) = re.find(stem)
+        && m.start() > 0
+    {
+        return Some(stem[..m.start()].to_string());
+    }
+    None
+}
+
 // ---------------------------------------------------------------------------
 // llama.cpp name-matching helpers
 // ---------------------------------------------------------------------------
@@ -4028,6 +4058,12 @@ pub fn tag_matches_model(tag: &str, hf_name: &str) -> bool {
         .to_string();
     let mut stem_set = HashSet::new();
     if let Some(base) = strip_gguf_quant_suffix(&stem) {
+        stem_set.insert(base);
+    }
+    // Third arm: MLX community tags carry mlx-community basenames
+    // (`llama-3.2-1b-instruct-4bit`); strip the quant tail so they reduce to
+    // catalog slugs through the same exact-stem path as GGUF stems (#854).
+    if let Some(base) = strip_mlx_quant_suffix(&stem) {
         stem_set.insert(base);
     }
     stem_set.insert(stem);
@@ -5023,6 +5059,69 @@ mod tests {
         assert!(tag_matches_model(
             "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf",
             "Qwen/Qwen3.6-35B-A3B"
+        ));
+    }
+
+    #[test]
+    fn test_strip_mlx_quant_suffix_patterns() {
+        // Plain bit-widths.
+        assert_eq!(
+            strip_mlx_quant_suffix("llama-3.2-1b-instruct-4bit").as_deref(),
+            Some("llama-3.2-1b-instruct")
+        );
+        assert_eq!(
+            strip_mlx_quant_suffix("internlm2_5-20b-chat-8bit").as_deref(),
+            Some("internlm2_5-20b-chat")
+        );
+        assert_eq!(
+            strip_mlx_quant_suffix("phi-4-2bit").as_deref(),
+            Some("phi-4")
+        );
+        assert_eq!(
+            strip_mlx_quant_suffix("gemma-2-2b-it-6bit").as_deref(),
+            Some("gemma-2-2b-it")
+        );
+        // Variant markers after the bit-width, including date-stamped DWQ.
+        assert_eq!(
+            strip_mlx_quant_suffix("meta-llama-3.1-8b-instruct-4bit-dwq").as_deref(),
+            Some("meta-llama-3.1-8b-instruct")
+        );
+        assert_eq!(
+            strip_mlx_quant_suffix("qwen3-8b-4bit-dwq-05082025").as_deref(),
+            Some("qwen3-8b")
+        );
+        // Compound schemes stripped as whole units.
+        assert_eq!(
+            strip_mlx_quant_suffix("gpt-oss-20b-mxfp4-q4").as_deref(),
+            Some("gpt-oss-20b")
+        );
+        assert_eq!(
+            strip_mlx_quant_suffix("mistral-7b-v0.1-fp16").as_deref(),
+            Some("mistral-7b-v0.1")
+        );
+        // Mid-name fragments and bare widths are not suffixes.
+        assert_eq!(strip_mlx_quant_suffix("some-4bitish-model"), None);
+        assert_eq!(strip_mlx_quant_suffix("4bit"), None);
+    }
+
+    #[test]
+    fn test_tag_matches_model_mlx_community_tags() {
+        // End-to-end: verbatim `model` tags from the apple-m4-pro MLX
+        // community submissions (#853) must resolve to their catalog HF
+        // names, exactly like GGUF stems do (#854).
+        assert!(tag_matches_model(
+            "Llama-3.2-1B-Instruct-4bit",
+            "meta-llama/Llama-3.2-1B-Instruct"
+        ));
+        assert!(tag_matches_model("Qwen3-14B-4bit", "Qwen/Qwen3-14B"));
+        assert!(tag_matches_model(
+            "gpt-oss-20b-MXFP4-Q4",
+            "openai/gpt-oss-20b"
+        ));
+        // One model's basename must not match another model.
+        assert!(!tag_matches_model(
+            "Qwen3-8B-4bit",
+            "meta-llama/Llama-3.2-1B-Instruct"
         ));
     }
 
