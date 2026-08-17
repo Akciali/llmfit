@@ -2933,14 +2933,46 @@ impl RamaLamaProvider {
     /// so detection works without a running server. Returns `None` when the
     /// `ramalama` binary is absent or the command fails.
     fn installed_from_store() -> Option<(HashSet<String>, usize)> {
-        let output = std::process::Command::new("ramalama")
+        let mut child = std::process::Command::new("ramalama")
             .args(["ls", "--json"])
-            .output()
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
             .ok()?;
-        if !output.status.success() {
-            return None;
+        let mut stdout = child.stdout.take()?;
+        let reader = std::thread::spawn(move || {
+            let mut output = Vec::new();
+            std::io::Read::read_to_end(&mut stdout, &mut output).map(|_| output)
+        });
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    if !status.success() {
+                        let _ = reader.join();
+                        return None;
+                    }
+                    let output = reader.join().ok()?.ok()?;
+                    return parse_ramalama_store(&output);
+                }
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+                Ok(None) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = reader.join();
+                    return None;
+                }
+                Err(_) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = reader.join();
+                    return None;
+                }
+            }
         }
-        parse_ramalama_store(&output.stdout)
     }
 
     pub fn installed_models_counted(&self) -> (HashSet<String>, usize) {
@@ -2999,6 +3031,19 @@ fn parse_ramalama_store(json: &[u8]) -> Option<(HashSet<String>, usize)> {
     Some((set, count))
 }
 
+fn resolve_ramalama_detection(
+    server_models: Option<(HashSet<String>, usize)>,
+    store_models: Option<(HashSet<String>, usize)>,
+) -> (bool, HashSet<String>, usize) {
+    if let Some((set, count)) = server_models {
+        return (true, set, count);
+    }
+    match store_models {
+        Some((set, count)) => (true, set, count),
+        None => (false, HashSet::new(), 0),
+    }
+}
+
 impl ModelProvider for RamaLamaProvider {
     fn name(&self) -> &str {
         "RamaLama"
@@ -3022,6 +3067,37 @@ impl ModelProvider for RamaLamaProvider {
         Err("RamaLama does not support downloading models at runtime. \
              Serve the desired model with `ramalama serve <model>`."
             .to_string())
+    }
+}
+
+#[cfg(test)]
+mod ramalama_detection_tests {
+    use super::{insert_ramalama_name, parse_ramalama_store, resolve_ramalama_detection};
+    use std::collections::HashSet;
+
+    #[test]
+    fn unavailable_server_uses_local_store_model() {
+        let json = br#"[{"name":"huggingface://org/model-x","shortname":""}]"#;
+        let store_models = parse_ramalama_store(json).expect("store data should parse");
+        let (available, installed, count) = resolve_ramalama_detection(None, Some(store_models));
+
+        assert!(available);
+        assert_eq!(count, 1);
+        assert!(installed.contains("model-x"));
+    }
+
+    #[test]
+    fn server_models_take_precedence_over_local_store() {
+        let mut server = HashSet::new();
+        insert_ramalama_name(&mut server, "org/server-model");
+        let mut store = HashSet::new();
+        insert_ramalama_name(&mut store, "org/local-model");
+
+        let (_, installed, count) = resolve_ramalama_detection(Some((server, 1)), Some((store, 1)));
+
+        assert_eq!(count, 1);
+        assert!(installed.contains("server-model"));
+        assert!(!installed.contains("local-model"));
     }
 }
 

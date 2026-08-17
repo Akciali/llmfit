@@ -7,7 +7,7 @@ use llmfit_core::models::{LlmModel, ModelDatabase, UseCase};
 use llmfit_core::plan::{PlanRequest, estimate_model_plan};
 use llmfit_core::providers::{
     DockerModelRunnerProvider, LlamaCppProvider, LmStudioProvider, MlxProvider, ModelProvider,
-    OllamaProvider, VllmProvider,
+    OllamaProvider, RamaLamaProvider, VllmProvider,
 };
 use rmcp::handler::server::{router::tool::ToolRouter, wrapper::Parameters};
 use rmcp::{ServerHandler, ServiceExt, tool, tool_handler, tool_router};
@@ -258,6 +258,10 @@ impl LlmfitMcpServer {
             name: "vllm",
             installed: VllmProvider::new().is_available(),
         });
+        set.spawn_blocking(|| RuntimeInfo {
+            name: "ramalama",
+            installed: RamaLamaProvider::new().detect_with_installed().0,
+        });
 
         let mut runtimes = Vec::new();
         while let Some(result) = set.join_next().await {
@@ -305,21 +309,22 @@ impl LlmfitMcpServer {
             let p = VllmProvider::new();
             ("vllm", p.is_available(), p.installed_models())
         });
+        set.spawn_blocking(|| {
+            let p = RamaLamaProvider::new();
+            let (available, installed, _) = p.detect_with_installed();
+            ("ramalama", available, installed)
+        });
 
-        let mut models = Vec::new();
+        let mut detected = Vec::new();
         while let Some(result) = set.join_next().await {
             if let Ok((name, available, installed)) = result
                 && available
             {
-                for model_name in installed {
-                    models.push(InstalledModel {
-                        name: model_name,
-                        runtime: name.to_string(),
-                    });
-                }
+                detected.push((name, installed));
             }
         }
 
+        let models = installed_models_from_results(detected);
         let result = serde_json::json!({ "models": models });
         serde_json::to_string_pretty(&result).unwrap_or_default()
     }
@@ -343,6 +348,20 @@ impl LlmfitMcpServer {
 
         fits
     }
+}
+
+fn installed_models_from_results(
+    results: Vec<(&'static str, std::collections::HashSet<String>)>,
+) -> Vec<InstalledModel> {
+    results
+        .into_iter()
+        .flat_map(|(runtime, models)| {
+            models.into_iter().map(move |name| InstalledModel {
+                name,
+                runtime: runtime.to_string(),
+            })
+        })
+        .collect()
 }
 
 // --- Entry point ---
@@ -432,4 +451,71 @@ fn fit_at_least(actual: FitLevel, minimum: FitLevel) -> bool {
         FitLevel::TooTight => 0,
     };
     rank(actual) >= rank(minimum)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::Value;
+
+    fn test_server() -> LlmfitMcpServer {
+        LlmfitMcpServer::new(
+            SystemSpecs::detect(),
+            ModelDatabase::new().get_all_models().clone(),
+            None,
+            "test-node".to_string(),
+        )
+    }
+
+    #[test]
+    fn runtime_discovery_includes_ramalama() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime should build");
+        let output = runtime.block_on(test_server().get_runtimes());
+        let value: Value = serde_json::from_str(&output).expect("runtime output should be JSON");
+        let runtimes = value
+            .get("runtimes")
+            .and_then(Value::as_array)
+            .expect("runtime output should contain an array");
+
+        assert!(
+            runtimes
+                .iter()
+                .any(|runtime| { runtime.get("name").and_then(Value::as_str) == Some("ramalama") })
+        );
+    }
+
+    #[test]
+    fn installed_model_discovery_returns_json_when_providers_are_unavailable() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime should build");
+        let output = runtime.block_on(test_server().get_installed_models());
+        let value: Value =
+            serde_json::from_str(&output).expect("installed model output should be JSON");
+        let models = value
+            .get("models")
+            .and_then(Value::as_array)
+            .expect("installed model output should contain an array");
+
+        assert!(models.iter().all(|model| {
+            model.get("name").and_then(Value::as_str).is_some()
+                && model.get("runtime").and_then(Value::as_str).is_some()
+        }));
+    }
+
+    #[test]
+    fn installed_model_discovery_preserves_ramalama_model_identity() {
+        let models = installed_models_from_results(vec![(
+            "ramalama",
+            std::collections::HashSet::from(["model-x".to_string()]),
+        )]);
+
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].runtime, "ramalama");
+        assert_eq!(models[0].name, "model-x");
+    }
 }
