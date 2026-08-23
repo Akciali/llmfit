@@ -473,17 +473,64 @@ fn openai_models_url(base_url: &str) -> String {
     format!("{}/v1/models", base_url.trim_end_matches('/'))
 }
 
+/// Identity of an OpenAI-compatible endpoint, read from the `/v1/models`
+/// response itself so a server is recognized before any of its model ids
+/// are imported (#791, #790).
+///
+/// Measured against live servers (2026-08-23): llama-server stamps
+/// `Server: llama.cpp` on every response and lists models with
+/// `owned_by: "llamacpp"`; llama-swap lists models with
+/// `owned_by: "llama-swap"`; mlx_lm.server (0.31.3) sends a Python
+/// `BaseHTTP` Server header and no `owned_by` field at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OpenAiEndpointIdentity {
+    /// llama.cpp serving directly.
+    LlamaCpp,
+    /// A llama-swap proxy fronting llama.cpp instances.
+    LlamaSwap,
+    /// No foreign marker recognized.
+    Unrecognized,
+}
+
+fn classify_openai_endpoint(
+    server_header: Option<&str>,
+    list: &OpenAiModelList,
+) -> OpenAiEndpointIdentity {
+    let owned_by = |name: &str| {
+        list.data.iter().any(|model| {
+            model
+                .owned_by
+                .as_deref()
+                .is_some_and(|owner| owner.eq_ignore_ascii_case(name))
+        })
+    };
+    if owned_by("llama-swap") {
+        return OpenAiEndpointIdentity::LlamaSwap;
+    }
+    if owned_by("llamacpp") || server_header.is_some_and(|s| s.eq_ignore_ascii_case("llama.cpp")) {
+        return OpenAiEndpointIdentity::LlamaCpp;
+    }
+    OpenAiEndpointIdentity::Unrecognized
+}
+
 fn fetch_openai_model_list(
     base_url: &str,
     timeout: std::time::Duration,
-) -> Option<OpenAiModelList> {
+) -> Option<(OpenAiModelList, OpenAiEndpointIdentity)> {
     let resp = ureq::get(&openai_models_url(base_url))
         .config()
         .timeout_global(Some(timeout))
         .build()
         .call()
         .ok()?;
-    resp.into_body().read_json::<OpenAiModelList>().ok()
+    let server_header = resp
+        .headers()
+        .get("server")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let list = resp.into_body().read_json::<OpenAiModelList>().ok()?;
+    let identity = classify_openai_endpoint(server_header.as_deref(), &list);
+    Some((list, identity))
 }
 
 fn openai_model_list_is_omlx(list: &OpenAiModelList) -> bool {
@@ -567,6 +614,14 @@ impl MlxProvider {
         Self::default()
     }
 
+    #[cfg(test)]
+    fn with_server_url(url: &str) -> Self {
+        Self {
+            server_url: url.to_string(),
+            server_url_explicit: true,
+        }
+    }
+
     fn server_candidates(&self) -> Vec<MlxServerCandidate<'_>> {
         let mut candidates = vec![MlxServerCandidate {
             base_url: self.server_url.as_str(),
@@ -587,7 +642,13 @@ impl MlxProvider {
     ) -> Option<OpenAiModelList> {
         let has_omlx_status = candidate.require_omlx_identity
             && endpoint_has_omlx_status(candidate.base_url, timeout);
-        let list = fetch_openai_model_list(candidate.base_url, timeout)?;
+        let (list, identity) = fetch_openai_model_list(candidate.base_url, timeout)?;
+        // Shared identity gate (#791): a llama.cpp server or a llama-swap
+        // proxy answering on this port is not an MLX runtime, so its model
+        // list must not be imported as MLX models.
+        if identity != OpenAiEndpointIdentity::Unrecognized {
+            return None;
+        }
         if candidate.require_omlx_identity && !has_omlx_status && !openai_model_list_is_omlx(&list)
         {
             return None;
@@ -2893,6 +2954,13 @@ impl RamaLamaProvider {
         Self::default()
     }
 
+    #[cfg(test)]
+    fn with_base_url(url: &str) -> Self {
+        Self {
+            base_url: url.to_string(),
+        }
+    }
+
     fn models_url(&self) -> String {
         format!("{}/v1/models", self.base_url.trim_end_matches('/'))
     }
@@ -2918,9 +2986,27 @@ impl RamaLamaProvider {
             };
         };
 
-        let Ok(list) = resp.into_body().read_json::<RamaLamaModelList>() else {
+        let server_header = resp
+            .headers()
+            .get("server")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let Ok(list) = resp.into_body().read_json::<OpenAiModelList>() else {
             return (true, HashSet::new(), 0);
         };
+        // Shared identity gate (#791, #790): a llama-swap proxy answering on
+        // this port is not RamaLama, so treat it like no server at all and
+        // fall back to the on-disk store. A plain llama.cpp identity is not
+        // rejected on this path: `ramalama serve` drives llama-server inside
+        // its container, so a genuine endpoint may present it.
+        if classify_openai_endpoint(server_header.as_deref(), &list)
+            == OpenAiEndpointIdentity::LlamaSwap
+        {
+            return match Self::installed_from_store() {
+                Some((set, count)) => (true, set, count),
+                None => (false, HashSet::new(), 0),
+            };
+        }
         let count = list.data.len();
         let mut set = HashSet::new();
         for m in list.data {
@@ -2979,17 +3065,6 @@ impl RamaLamaProvider {
         let (_, set, count) = self.detect_with_installed();
         (set, count)
     }
-}
-
-#[derive(serde::Deserialize)]
-struct RamaLamaModelList {
-    data: Vec<RamaLamaModel>,
-}
-
-#[derive(serde::Deserialize)]
-struct RamaLamaModel {
-    /// Model id, e.g. "meta-llama/Llama-3.1-8B-Instruct"
-    id: String,
 }
 
 /// A row from `ramalama ls --json`. Extra fields (modified, size) are ignored.
@@ -5901,6 +5976,113 @@ mod tests {
         .expect("test payload should parse");
 
         assert!(!openai_model_list_is_omlx(&list));
+    }
+
+    /// Verbatim `/v1/models` body captured from llama-swap v251 (4ec3175)
+    /// on 2026-08-23. The regression tests below feed it to both providers.
+    const LLAMA_SWAP_MODELS_FIXTURE: &str = r#"{"data":[{"id":"llama-3.2-1b-instruct","object":"model","created":1787482072,"owned_by":"llama-swap","meta":{"llamaswap":{"type":"model"}},"status":{"value":"unloaded"}}],"object":"list"}"#;
+
+    /// Verbatim `/v1/models` body captured from llama-server build 10520
+    /// (cd644c395) on 2026-08-23.
+    const LLAMA_SERVER_MODELS_FIXTURE: &str = r#"{"models":[{"name":"models/Llama-3.2-1B-Instruct-Q4_K_M.gguf","model":"models/Llama-3.2-1B-Instruct-Q4_K_M.gguf","modified_at":"","size":"","digest":"","type":"model","description":"","tags":[""],"capabilities":["completion"],"parameters":"","details":{"parent_model":"","format":"gguf","family":"","families":[""],"parameter_size":"","quantization_level":""}}],"object":"list","data":[{"id":"models/Llama-3.2-1B-Instruct-Q4_K_M.gguf","aliases":["models/Llama-3.2-1B-Instruct-Q4_K_M.gguf"],"tags":[],"object":"model","created":1787482072,"owned_by":"llamacpp","meta":{"vocab_type":2,"n_vocab":128256,"n_ctx":131072,"n_ctx_train":131072,"n_embd":2048,"n_params":1235814432,"size":799862912,"ftype":"Q4_K - Medium"}}]}"#;
+
+    /// Verbatim `/v1/models` body captured from mlx_lm.server 0.31.3 on
+    /// 2026-08-23: no `owned_by` field at all.
+    const MLX_LM_MODELS_FIXTURE: &str = r#"{"object": "list", "data": [{"id": "mlx-community/Llama-3.2-1B-Instruct-4bit", "object": "model", "created": 1787482072}]}"#;
+
+    #[test]
+    fn test_classify_openai_endpoint_measured_payloads() {
+        let swap: OpenAiModelList =
+            serde_json::from_str(LLAMA_SWAP_MODELS_FIXTURE).expect("fixture should parse");
+        assert_eq!(
+            classify_openai_endpoint(None, &swap),
+            OpenAiEndpointIdentity::LlamaSwap
+        );
+
+        let llamacpp: OpenAiModelList =
+            serde_json::from_str(LLAMA_SERVER_MODELS_FIXTURE).expect("fixture should parse");
+        assert_eq!(
+            classify_openai_endpoint(Some("llama.cpp"), &llamacpp),
+            OpenAiEndpointIdentity::LlamaCpp
+        );
+        // The body alone is enough: the entry carries `owned_by: "llamacpp"`.
+        assert_eq!(
+            classify_openai_endpoint(None, &llamacpp),
+            OpenAiEndpointIdentity::LlamaCpp
+        );
+
+        let mlx: OpenAiModelList =
+            serde_json::from_str(MLX_LM_MODELS_FIXTURE).expect("fixture should parse");
+        assert_eq!(
+            classify_openai_endpoint(Some("BaseHTTP/0.6 Python/3.14.7"), &mlx),
+            OpenAiEndpointIdentity::Unrecognized
+        );
+        // A llama.cpp Server header marks the endpoint even when the body
+        // carries no owner, as during model load.
+        let empty: OpenAiModelList = serde_json::from_str(r#"{"object":"list","data":[]}"#)
+            .expect("empty list should parse");
+        assert_eq!(
+            classify_openai_endpoint(Some("llama.cpp"), &empty),
+            OpenAiEndpointIdentity::LlamaCpp
+        );
+        assert_eq!(
+            classify_openai_endpoint(None, &empty),
+            OpenAiEndpointIdentity::Unrecognized
+        );
+    }
+
+    /// Serve one HTTP response carrying the given body on an ephemeral
+    /// loopback port, and return its base URL.
+    fn serve_fixture(body: &'static str) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        let addr = listener.local_addr().expect("test listener addr");
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        format!("http://{}", addr)
+    }
+
+    // Regression for #791: a llama-swap response on the probed port must not
+    // be imported as MLX models. Goes through the real probe, which applies
+    // classify_openai_endpoint, the same gate the RamaLama path uses below.
+    // On non-macOS the MLX probe skips the network path entirely, which
+    // satisfies the same assertion.
+    #[test]
+    fn test_llama_swap_endpoint_not_imported_as_mlx() {
+        let provider = MlxProvider::with_server_url(&serve_fixture(LLAMA_SWAP_MODELS_FIXTURE));
+        let (_, installed) = provider.detect_with_installed();
+        assert!(!installed.contains("llama-3.2-1b-instruct"));
+    }
+
+    // Regression for #790: the same llama-swap response must not mark the
+    // RamaLama provider as serving models. Same gate as the MLX path above.
+    #[test]
+    fn test_llama_swap_endpoint_not_imported_as_ramalama() {
+        let provider = RamaLamaProvider::with_base_url(&serve_fixture(LLAMA_SWAP_MODELS_FIXTURE));
+        let (_, installed, _count) = provider.detect_with_installed();
+        assert!(!installed.contains("llama-3.2-1b-instruct"));
+    }
+
+    // Control: the same harness with a payload carrying no foreign marker IS
+    // imported, so the rejection above comes from the identity gate and not
+    // from a failed fetch.
+    #[test]
+    fn test_unmarked_endpoint_still_imported_as_ramalama() {
+        let provider = RamaLamaProvider::with_base_url(&serve_fixture(MLX_LM_MODELS_FIXTURE));
+        let (available, installed, count) = provider.detect_with_installed();
+        assert!(available);
+        assert_eq!(count, 1);
+        assert!(installed.contains("mlx-community/llama-3.2-1b-instruct-4bit"));
     }
 
     #[test]
