@@ -3392,6 +3392,13 @@ const LLAMACPP_GGUF_MAPPINGS: &[(&str, &str)] = &[
         "bartowski/Mixtral-8x7B-Instruct-v0.1-GGUF",
     ),
     // Google Gemma
+    ("gemma-4-e2b-it", "bartowski/google_gemma-4-E2B-it-GGUF"),
+    ("gemma-4-e4b-it", "bartowski/google_gemma-4-E4B-it-GGUF"),
+    (
+        "gemma-4-26b-a4b-it",
+        "bartowski/google_gemma-4-26B-A4B-it-GGUF",
+    ),
+    ("gemma-4-31b-it", "bartowski/google_gemma-4-31B-it-GGUF"),
     ("gemma-3-12b-it", "bartowski/gemma-3-12b-it-GGUF"),
     ("gemma-2-27b-it", "bartowski/gemma-2-27b-it-GGUF"),
     ("gemma-2-9b-it", "bartowski/gemma-2-9b-it-GGUF"),
@@ -4883,6 +4890,32 @@ mod tests {
         // Models with hardcoded mappings should be found
         assert!(lookup_gguf_repo("meta-llama/Llama-3.1-8B-Instruct").is_some());
         assert!(lookup_gguf_repo("deepseek-r1").is_some());
+    }
+
+    #[test]
+    fn test_lookup_gguf_repo_gemma4_bartowski_mappings() {
+        // The four Gemma 4 instruct models resolve to the Bartowski GGUF
+        // repos (issue #332). Bartowski publishes these under owner-prefixed
+        // names ("google_..."), which the heuristic candidates never produce,
+        // so the explicit mappings are load-bearing. The scraper-provided
+        // gguf_sources in the model database are untouched and remain
+        // available as fallbacks.
+        assert_eq!(
+            lookup_gguf_repo("google/gemma-4-E2B-it"),
+            Some("bartowski/google_gemma-4-E2B-it-GGUF")
+        );
+        assert_eq!(
+            lookup_gguf_repo("google/gemma-4-E4B-it"),
+            Some("bartowski/google_gemma-4-E4B-it-GGUF")
+        );
+        assert_eq!(
+            lookup_gguf_repo("google/gemma-4-26B-A4B-it"),
+            Some("bartowski/google_gemma-4-26B-A4B-it-GGUF")
+        );
+        assert_eq!(
+            lookup_gguf_repo("google/gemma-4-31B-it"),
+            Some("bartowski/google_gemma-4-31B-it-GGUF")
+        );
     }
 
     #[test]
