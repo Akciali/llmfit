@@ -3850,7 +3850,10 @@ const OLLAMA_MAPPINGS: &[(&str, &str)] = &[
     ("codellama-13b-instruct-hf", "codellama:13b"),
     ("codellama-7b-instruct-hf", "codellama:7b"),
     // Google Gemma
+    ("gemma-3-27b-it", "gemma3:27b"),
     ("gemma-3-12b-it", "gemma3:12b"),
+    ("gemma-3-4b-it", "gemma3:4b"),
+    ("gemma-3-1b-it", "gemma3:1b"),
     ("gemma-2-27b-it", "gemma2:27b"),
     ("gemma-2-9b-it", "gemma2:9b"),
     ("gemma-2-2b-it", "gemma2:2b"),
@@ -4697,6 +4700,31 @@ mod tests {
             hf_name_to_ollama_candidates("Qwen/Qwen3.8-27B"),
             vec!["qwen3.8:27b".to_string()]
         );
+    }
+
+    // Regression for #866: every gemma3 size Ollama ships must resolve
+    // through the explicit mapping, so an `ollama pull gemma3:4b` install
+    // is detected and the model stays pullable. Only the 12B was mapped.
+    #[test]
+    fn test_gemma3_family_resolves_to_its_ollama_tags() {
+        for (hf_name, tag) in [
+            ("google/gemma-3-1b-it", "gemma3:1b"),
+            ("google/gemma-3-4b-it", "gemma3:4b"),
+            ("google/gemma-3-12b-it", "gemma3:12b"),
+            ("google/gemma-3-27b-it", "gemma3:27b"),
+        ] {
+            assert_eq!(
+                hf_name_to_ollama_candidates(hf_name),
+                vec![tag.to_string()],
+                "candidates for {hf_name}"
+            );
+            assert!(has_ollama_mapping(hf_name), "mapping for {hf_name}");
+            let installed = HashSet::from([tag.to_string()]);
+            assert!(
+                is_model_installed(hf_name, &installed),
+                "install of {tag} must mark {hf_name} installed"
+            );
+        }
     }
 
     #[test]
