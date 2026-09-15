@@ -255,6 +255,59 @@ def test_in_flight_threads_report_one_pause_not_eight():
         assert abs(RATE_LIMIT_STATS["pause_seconds"] - 197.0) < 1e-6
 
 
+PROBE_URL = "https://huggingface.co/api/models/unsloth/model-GGUF"
+
+
+class _OneCandidateNoDisk:
+    """enrich_gguf_sources with one GGUF candidate and the cache kept in memory."""
+
+    def __enter__(self):
+        self._saved = (
+            shm._load_gguf_cache,
+            shm._save_gguf_cache,
+            shm._model_gguf_repo_candidates,
+        )
+        self.cache_writes: list[dict] = []
+        shm._load_gguf_cache = dict
+        shm._save_gguf_cache = lambda cache: self.cache_writes.append(dict(cache))
+        shm._model_gguf_repo_candidates = lambda repo_id: [
+            ("unsloth", "unsloth/model-GGUF")
+        ]
+        self._quiet = contextlib.redirect_stdout(io.StringIO())
+        self._quiet.__enter__()
+        return self
+
+    def __exit__(self, *exc):
+        self._quiet.__exit__(*exc)
+        (
+            shm._load_gguf_cache,
+            shm._save_gguf_cache,
+            shm._model_gguf_repo_candidates,
+        ) = self._saved
+
+
+def test_exhausted_gguf_probe_is_not_cached_as_a_miss():
+    burst = [
+        _http_error(PROBE_URL, 429, ratelimit='"api";r=0;t=3')
+        for _ in range(RATE_LIMIT_MAX_RETRIES + 1)
+    ]
+    model = {"name": "org/model", "format": "gguf", "parameters_raw": 1}
+    with _FakeHF(burst), _OneCandidateNoDisk() as gguf:
+        assert shm.enrich_gguf_sources([model], threads=1) == 0
+        assert RATE_LIMIT_STATS["gave_up"] == 1
+    assert "gguf_sources" not in model
+    assert gguf.cache_writes == [{}], gguf.cache_writes
+
+
+def test_missing_gguf_repo_is_still_cached_as_a_miss():
+    model = {"name": "org/model", "format": "gguf", "parameters_raw": 1}
+    with _FakeHF([_http_error(PROBE_URL, 404)]), _OneCandidateNoDisk() as gguf:
+        assert shm.enrich_gguf_sources([model], threads=1) == 0
+    assert "gguf_sources" not in model
+    assert list(gguf.cache_writes[0]) == ["org/model"]
+    assert gguf.cache_writes[0]["org/model"]["sources"] == []
+
+
 if __name__ == "__main__":
     tests = [
         test_preserves_architecture_when_config_fetch_misses,
@@ -271,6 +324,8 @@ if __name__ == "__main__":
         test_bucket_named_by_the_response_drives_the_retry_wait,
         test_wait_is_capped_against_bogus_reset_values,
         test_in_flight_threads_report_one_pause_not_eight,
+        test_exhausted_gguf_probe_is_not_cached_as_a_miss,
+        test_missing_gguf_repo_is_still_cached_as_a_miss,
     ]
     for fn in tests:
         fn()
