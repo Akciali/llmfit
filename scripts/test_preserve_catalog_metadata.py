@@ -14,6 +14,10 @@ from scrape_hf_models import (  # noqa: E402
     ARCH_METADATA_DROP_LIMIT,
     RATE_LIMIT_MAX_RETRIES,
     RATE_LIMIT_STATS,
+    detect_moe,
+    estimate_params_from_arch,
+    extract_arch_metadata,
+    infer_context_length,
     preserve_existing_metadata,
     rate_limit_summary,
 )
@@ -308,6 +312,81 @@ def test_missing_gguf_repo_is_still_cached_as_a_miss():
     assert gguf.cache_writes[0]["org/model"]["sources"] == []
 
 
+def test_yarn_context_is_not_scaled_twice():
+    # DeepSeek-V4: max_position_embeddings is already original * factor.
+    cfg = {
+        "max_position_embeddings": 1048576,
+        "rope_scaling": {"type": "yarn", "factor": 16,
+                         "original_max_position_embeddings": 65536},
+    }
+    assert infer_context_length(cfg) == 1048576
+    # Kimi-K2.6 nests the same shape under text_config.
+    nested = {"text_config": {
+        "max_position_embeddings": 262144,
+        "rope_scaling": {"type": "yarn", "factor": 64.0,
+                         "original_max_position_embeddings": 4096},
+    }}
+    assert infer_context_length(nested) == 262144
+
+
+def test_rope_factor_still_scales_a_pre_scaling_window():
+    # No original_max_position_embeddings: the value is the unscaled window.
+    cfg = {"max_position_embeddings": 4096,
+           "rope_scaling": {"type": "linear", "factor": 4.0}}
+    assert infer_context_length(cfg) == 16384
+    # original * factor larger than the stated window wins.
+    cfg = {"max_position_embeddings": 8192,
+           "rope_scaling": {"type": "yarn", "factor": 4,
+                            "original_max_position_embeddings": 8192}}
+    assert infer_context_length(cfg) == 32768
+
+
+def test_detects_moe_under_family_specific_key_names():
+    kimi_k3 = {"text_config": {"num_experts": 896, "num_experts_per_token": 16}}
+    moe = detect_moe("moonshotai/Kimi-K3", kimi_k3, "kimi_k3", 2_779_931_837_184)
+    assert moe["is_moe"] and moe["num_experts"] == 896 and moe["active_experts"] == 16
+    assert moe["active_parameters"] == 104_000_000_000
+
+    step = {"text_config": {"moe_num_experts": 288, "moe_top_k": 8}}
+    moe = detect_moe("stepfun-ai/Step-3.7-Flash", step, "step3p7", 201_365_316_160)
+    assert moe["is_moe"] and moe["num_experts"] == 288 and moe["active_experts"] == 8
+    assert moe["active_parameters"] == 11_000_000_000
+
+
+def test_arch_metadata_drops_unset_sentinels():
+    # inclusionAI/LLaDA-UI: -1 failed the u32 parse of the whole catalog.
+    arch = extract_arch_metadata({
+        "num_hidden_layers": 28, "hidden_size": 2048, "num_attention_heads": 16,
+        "shared_expert_intermediate_size": -1,
+    })
+    assert arch["shared_expert_intermediate_size"] is None
+    assert arch["num_hidden_layers"] == 28
+    # 0 is a real MoE size (Qwen3-Coder has no shared expert) but never a
+    # real vocab; data/schema.json draws the same line.
+    arch = extract_arch_metadata({"shared_expert_intermediate_size": 0, "vocab_size": 0})
+    assert arch["shared_expert_intermediate_size"] == 0
+    assert arch["vocab_size"] is None
+    # GLM-5.3-Flash: head_dim=0 falls back to hidden_size / heads.
+    arch = extract_arch_metadata({"text_config": {
+        "hidden_size": 4096, "num_attention_heads": 64, "head_dim": 0,
+    }})
+    assert arch["head_dim"] == 64
+    # hidden_size < heads would derive 0 again; leave it null instead.
+    arch = extract_arch_metadata({"hidden_size": 8, "num_attention_heads": 16, "head_dim": 0})
+    assert arch["head_dim"] is None
+
+
+def test_param_estimate_sees_the_same_experts_as_detection():
+    base = {"hidden_size": 4096, "num_hidden_layers": 45, "vocab_size": 128896,
+            "num_attention_heads": 64, "moe_intermediate_size": 1280,
+            "intermediate_size": 11264}
+    dense = estimate_params_from_arch(base)
+    step = estimate_params_from_arch({**base, "moe_num_experts": 288, "moe_top_k": 8})
+    routed = estimate_params_from_arch({**base, "n_routed_experts": 288})
+    assert step == routed
+    assert step > 5 * dense
+
+
 if __name__ == "__main__":
     tests = [
         test_preserves_architecture_when_config_fetch_misses,
@@ -326,6 +405,11 @@ if __name__ == "__main__":
         test_in_flight_threads_report_one_pause_not_eight,
         test_exhausted_gguf_probe_is_not_cached_as_a_miss,
         test_missing_gguf_repo_is_still_cached_as_a_miss,
+        test_yarn_context_is_not_scaled_twice,
+        test_rope_factor_still_scales_a_pre_scaling_window,
+        test_detects_moe_under_family_specific_key_names,
+        test_arch_metadata_drops_unset_sentinels,
+        test_param_estimate_sees_the_same_experts_as_detection,
     ]
     for fn in tests:
         fn()
