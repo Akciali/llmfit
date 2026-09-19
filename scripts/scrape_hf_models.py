@@ -22,7 +22,7 @@ import threading
 import time
 import urllib.request
 import urllib.error
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 HF_API = "https://huggingface.co/api/models"
 
@@ -1351,11 +1351,7 @@ def scrape_model(repo_id: str) -> dict | None:
         infer_context_length(full_config) if full_config else infer_context_length(config),
     )
 
-    # Correct parameters_raw when safetensors reports quantized element counts
-    # instead of true parameter count (common in FP8/INT4/INT8 repos).
-    arch_params = estimate_params_from_arch(full_config)
-    if arch_params and arch_params > total_params * 2:
-        total_params = arch_params
+    total_params = correct_packed_param_count(repo_id, total_params, full_config)
 
     min_ram, rec_ram = estimate_ram(total_params, default_quant)
     min_vram = estimate_vram(total_params, default_quant)
@@ -1406,6 +1402,136 @@ def scrape_model(repo_id: str) -> dict | None:
         result["active_parameters"] = moe_info["active_parameters"]
 
     return result
+
+
+# Retained entries re-fetched per run. The merge is additive, so a model that
+# drops out of discovery keeps whatever the scraper believed when it was last
+# seen, including values later scraper fixes would correct. Two requests per
+# entry keeps the default inside one HF api window.
+RETAINED_REVALIDATION_BUDGET = 250
+
+# Days before an attempted entry is eligible again, whether the attempt
+# succeeded or not.
+REVALIDATION_COOLDOWN_DAYS = 90
+
+# Context windows above this are rare enough to be worth a second look; the
+# YaRN double-scaling bug produced 16M-167M values.
+SUSPECT_CONTEXT_LENGTH = 2_097_152
+
+# Name markers of a pre-quantized safetensors repo. HF reports the packed
+# element count as safetensors.total for these, which understates parameters
+# 3-6x unless config.json is available to correct it.
+_PREQUANTIZED_NAME = re.compile(
+    r"(?<![a-z0-9])(awq|gptq|autoround|auto-round|int4|int8|w4a16|w8a8|w8a16|w4a8"
+    r"|fp8|nvfp4|mxfp4|mxfp8|bnb|[48]bit)(?![a-z0-9])",
+    re.IGNORECASE,
+)
+
+
+def _name_says_prequantized(repo_id: str) -> bool:
+    base = repo_id.split("/")[-1]
+    # google/gemma-3-1b-it-qat-int4-unquantized names the recipe it was
+    # trained for, but ships full-precision weights with an exact count.
+    if "unquantized" in base.lower():
+        return False
+    return bool(_PREQUANTIZED_NAME.search(base))
+
+
+def is_prequantized_repo(repo_id: str, config: dict | None) -> bool:
+    """True when the repo ships packed/quantized weights rather than full
+    precision: config.json says so, or the name does."""
+    cfg = config or {}
+    if cfg.get("quantization_config") or cfg.get("quantization"):
+        return True
+    return _name_says_prequantized(repo_id)
+
+
+def correct_packed_param_count(repo_id: str, total_params: int,
+                               config: dict | None) -> int:
+    """Replace a packed element count with the architecture estimate.
+
+    safetensors.total counts tensor elements, so int4 weights packed into
+    int32 report ~1/6 of the real parameters (#1045). That only happens to
+    quantized repos: for a full-precision checkpoint the count is exact, and
+    the estimate must not override it. The estimate over-counts hybrid models
+    (it prices every Nemotron-H layer as a MoE transformer layer, 101.6B for
+    a 31.6B BF16 checkpoint), which the 2x margin alone does not catch.
+    """
+    if not is_prequantized_repo(repo_id, config):
+        return total_params
+    arch_params = estimate_params_from_arch(config)
+    if arch_params and arch_params > total_params * 2:
+        return arch_params
+    return total_params
+
+
+def revalidation_priority(model: dict) -> int | None:
+    """Rank how likely a retained entry is to carry a stale, wrong value.
+
+    Lower is more urgent; None means there is no specific reason to re-fetch.
+    """
+    name = model.get("name", "")
+    prequantized = (
+        model.get("format") in ("awq", "gptq", "autoround")
+        or _name_says_prequantized(name)
+    )
+    if prequantized and not model.get("hidden_size"):
+        return 0  # packed parameter count nothing has been able to correct
+    if (model.get("context_length") or 0) > SUSPECT_CONTEXT_LENGTH:
+        return 1
+    if not model.get("release_date"):
+        return 2
+    return None
+
+
+def revalidation_lost_parameters(before: dict, after: dict) -> bool:
+    """True when a re-fetch reports far fewer parameters than the retained
+    entry. Revalidation exists to fix understated counts, so a sharp drop is
+    more likely a packed count the estimator could not correct (gpt-oss-20b
+    3-bit repos: 22.3B retained, 2.9B re-fetched) than a real correction."""
+    old = before.get("parameters_raw") or 0
+    new = after.get("parameters_raw") or 0
+    return old > 0 and new < old / 1.5
+
+
+def _revalidated_recently(model: dict, today: date) -> bool:
+    stamp = model.get("_revalidated")
+    if not stamp:
+        return False
+    try:
+        attempted = date.fromisoformat(stamp)
+    except (TypeError, ValueError):
+        return False
+    return (today - attempted).days < REVALIDATION_COOLDOWN_DAYS
+
+
+def select_retained_for_revalidation(
+    existing: list[dict], fresh_names: set[str], budget: int,
+    today: date | None = None,
+) -> list[str]:
+    """Pick the retained entries most worth re-fetching this run.
+
+    Ordered by priority, then by downloads so the entries users actually see
+    are corrected first. Entries scraped this run are never selected, and
+    neither is one attempted within the cooldown: a repo that is gone or
+    gated fails the same way every week, and without the cooldown those
+    failures would hold the top of the ranking and starve everything below.
+    """
+    if budget <= 0:
+        return []
+    today = today or date.today()
+    ranked = []
+    for model in existing:
+        name = model.get("name", "")
+        if not name or name in fresh_names:
+            continue
+        if _revalidated_recently(model, today):
+            continue
+        priority = revalidation_priority(model)
+        if priority is not None:
+            ranked.append((priority, -(model.get("hf_downloads") or 0), name))
+    ranked.sort()
+    return [name for _, _, name in ranked[:budget]]
 
 
 def scrape_models_parallel(repo_ids: list[str], threads: int) -> tuple[list[dict], set[str]]:
@@ -2077,10 +2203,7 @@ def _build_discovered_model(listing: dict) -> dict | None:
         infer_context_length(full_config) if full_config else infer_context_length(config),
     )
 
-    # Correct parameters_raw when safetensors reports quantized element counts
-    arch_params = estimate_params_from_arch(full_config)
-    if arch_params and arch_params > total_params * 2:
-        total_params = arch_params
+    total_params = correct_packed_param_count(repo_id, total_params, full_config)
 
     min_ram, rec_ram = estimate_ram(total_params, default_quant)
     min_vram = estimate_vram(total_params, default_quant)
@@ -2176,6 +2299,13 @@ def main():
         "-n", "--discover-limit", type=int, default=1000,
         help="Max number of top-downloaded models to discover (default: 1000). "
              "Duplicates of curated models are skipped automatically."
+    )
+    parser.add_argument(
+        "--revalidate", type=int, default=RETAINED_REVALIDATION_BUDGET,
+        help="Max retained (not re-discovered) entries to re-fetch per run, "
+             "most suspect first: pre-quantized repos with no architecture "
+             "metadata, implausible context windows, missing release dates "
+             f"(default: {RETAINED_REVALIDATION_BUDGET}, 0 to disable)."
     )
     parser.add_argument(
         "--min-downloads", type=int, default=10000,
@@ -3389,6 +3519,47 @@ def main():
                         scraped_names.add(repo_id)
                         discovered_count += 1
 
+    # --- Revalidate a slice of the entries the merge would retain as-is ---
+    revalidated_count = 0
+    retained_stamps: dict[str, str] = {}
+    if args.revalidate > 0 and os.path.exists("llmfit-core/data/hf_models.json"):
+        try:
+            with open("llmfit-core/data/hf_models.json") as f:
+                prior = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            prior = []
+        prior_by_name = {m.get("name"): m for m in prior}
+        stale = select_retained_for_revalidation(prior, scraped_names, args.revalidate)
+        if stale:
+            print(f"\nRevalidating {len(stale)} retained entries "
+                  f"(budget {args.revalidate})...\n")
+            refreshed, _ = scrape_models_parallel(stale, args.threads)
+            stamp = date.today().isoformat()
+            # Every attempt is stamped, including the ones that stay retained
+            # below, so next run's budget moves on to other candidates.
+            for name in stale:
+                prior_by_name[name]["_revalidated"] = stamp
+            for model in refreshed:
+                # A repo that is gone, gated or unparseable returns nothing
+                # and stays retained; only a successful re-fetch replaces it.
+                before = prior_by_name[model["name"]]
+                if revalidation_lost_parameters(before, model):
+                    print(f"  ⚠ {model['name']}: re-fetch reports "
+                          f"{model['parameter_count']} against a retained "
+                          f"{before.get('parameter_count')}, keeping the retained entry",
+                          file=sys.stderr)
+                    continue
+                if before.get("_discovered"):
+                    model["_discovered"] = True
+                model["_revalidated"] = stamp
+                results.append(model)
+                scraped_names.add(model["name"])
+                revalidated_count += 1
+            # Entries that stay retained are re-read from disk by the merge,
+            # so hand it the stamped copies.
+            retained_stamps = {n: stamp for n in stale if n not in scraped_names}
+            print(f"\n  Revalidated {revalidated_count} of {len(stale)} retained entries")
+
     # --- Additive merge with existing database ---
     # The database is additive: models from previous runs are preserved.
     # Freshly scraped models update existing entries; historical models
@@ -3419,6 +3590,8 @@ def main():
                         updated_count += 1
                     elif name:
                         # Historical model not in current scrape — keep it
+                        if name in retained_stamps:
+                            old_model["_revalidated"] = retained_stamps[name]
                         results.append(old_model)
                         fresh_by_name[name] = old_model
                         scraped_names.add(name)

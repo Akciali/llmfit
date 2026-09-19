@@ -2,6 +2,7 @@
 """Guard: weekly scrape must not silently wipe architecture metadata."""
 
 import contextlib
+import datetime
 import email.message
 import io
 import sys
@@ -12,6 +13,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import scrape_hf_models as shm  # noqa: E402
 from scrape_hf_models import (  # noqa: E402
     ARCH_METADATA_DROP_LIMIT,
+    REVALIDATION_COOLDOWN_DAYS,
+    correct_packed_param_count,
+    is_prequantized_repo,
     RATE_LIMIT_MAX_RETRIES,
     RATE_LIMIT_STATS,
     detect_moe,
@@ -19,6 +23,9 @@ from scrape_hf_models import (  # noqa: E402
     extract_arch_metadata,
     infer_context_length,
     preserve_existing_metadata,
+    revalidation_lost_parameters,
+    revalidation_priority,
+    select_retained_for_revalidation,
     rate_limit_summary,
 )
 
@@ -387,6 +394,125 @@ def test_param_estimate_sees_the_same_experts_as_detection():
     assert step > 5 * dense
 
 
+def test_revalidation_ranks_uncorrectable_packed_counts_first():
+    # #1045: HF reports the packed int32 element count for these, and with no
+    # architecture metadata nothing downstream can correct it.
+    packed = {"name": "TelperionAI/Qwen3.8-27B-INT4-AWQ-GPTQ", "format": "awq",
+              "hidden_size": None, "release_date": "2026-08-20"}
+    assert revalidation_priority(packed) == 0
+    # The format field is "gguf" for names the format detector does not know.
+    w4a16 = {"name": "RedHatAI/NVIDIA-Nemotron-Nano-9B-v2-quantized.w4a16",
+             "format": "gguf", "hidden_size": None, "release_date": "2025-09-01"}
+    assert revalidation_priority(w4a16) == 0
+    # Same kind of repo, but config.json was read: the correction could fire.
+    assert revalidation_priority({**packed, "hidden_size": 5120}) is None
+    # "8B" is a size, not a bit width.
+    plain = {"name": "meta-llama/Llama-3.1-8B-Instruct", "format": "gguf",
+             "hidden_size": None, "release_date": "2024-07-18"}
+    assert revalidation_priority(plain) is None
+
+
+def test_revalidation_flags_suspect_context_and_missing_date():
+    base = {"name": "org/model", "format": "gguf", "hidden_size": 4096,
+            "release_date": "2026-01-01", "context_length": 131072}
+    assert revalidation_priority(base) is None
+    assert revalidation_priority({**base, "context_length": 16777216}) == 1
+    assert revalidation_priority({**base, "release_date": None}) == 2
+
+
+def test_revalidation_selection_respects_budget_and_skips_fresh_entries():
+    existing = [
+        {"name": "a/dateless-popular", "release_date": None, "hf_downloads": 9_000_000},
+        {"name": "b/model-AWQ", "format": "awq", "hidden_size": None,
+         "release_date": "2026-01-01", "hf_downloads": 10},
+        {"name": "c/model-GPTQ", "format": "gptq", "hidden_size": None,
+         "release_date": "2026-01-01", "hf_downloads": 500},
+        {"name": "d/rescraped-AWQ", "format": "awq", "hidden_size": None},
+        {"name": "e/healthy", "hidden_size": 4096, "release_date": "2026-01-01"},
+    ]
+    fresh = {"d/rescraped-AWQ"}
+    # Priority beats popularity; downloads order entries within a priority.
+    assert select_retained_for_revalidation(existing, fresh, 2) == [
+        "c/model-GPTQ", "b/model-AWQ"]
+    assert select_retained_for_revalidation(existing, fresh, 10) == [
+        "c/model-GPTQ", "b/model-AWQ", "a/dateless-popular"]
+    assert select_retained_for_revalidation(existing, fresh, 0) == []
+
+
+_QWEN38_27B_TEXT = {
+    "hidden_size": 5120, "num_hidden_layers": 64, "vocab_size": 248320,
+    "num_attention_heads": 24, "num_key_value_heads": 4, "head_dim": 256,
+    "intermediate_size": 17408,
+}
+
+
+def test_packed_count_is_corrected_only_for_quantized_repos():
+    # #1045: int4 packed into int32 reports 7.8B for a 27B-class model.
+    quantized = {"text_config": _QWEN38_27B_TEXT,
+                 "quantization_config": {"quant_method": "compressed-tensors"}}
+    fixed = correct_packed_param_count(
+        "TelperionAI/Qwen3.8-27B-INT4-AWQ-GPTQ", 7_839_289_360, quantized)
+    assert 20e9 < fixed < 32e9, fixed
+    # The name alone is enough when config.json does not declare it.
+    fixed = correct_packed_param_count(
+        "RedHatAI/Qwen3-32B-quantized.w4a16", 7_839_289_360,
+        {"text_config": _QWEN38_27B_TEXT})
+    assert fixed > 20e9
+
+    # A full-precision checkpoint's count is exact. The estimator prices every
+    # Nemotron-H layer as a MoE transformer layer and said 101.6B for this one.
+    nemotron_h = {"hidden_size": 2688, "num_hidden_layers": 52, "vocab_size": 131072,
+                  "num_attention_heads": 32, "num_key_value_heads": 2, "head_dim": 128,
+                  "n_routed_experts": 128, "num_experts_per_tok": 6,
+                  "moe_intermediate_size": 1856}
+    assert estimate_params_from_arch(nemotron_h) > 2 * 31_577_937_344
+    assert correct_packed_param_count(
+        "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16", 31_577_937_344, nemotron_h
+    ) == 31_577_937_344
+
+
+def test_revalidation_keeps_the_retained_entry_on_a_sharp_parameter_drop():
+    retained = {"parameters_raw": 22_300_000_000}
+    assert revalidation_lost_parameters(retained, {"parameters_raw": 2_900_000_000})
+    assert not revalidation_lost_parameters(retained, {"parameters_raw": 20_900_000_000})
+    assert not revalidation_lost_parameters({"parameters_raw": 7_839_289_360},
+                                            {"parameters_raw": 24_400_000_000})
+    assert not revalidation_lost_parameters({}, {"parameters_raw": 1})
+
+
+def test_revalidation_cooldown_stops_failures_holding_the_budget():
+    today = datetime.date(2026, 9, 19)
+    def awq(name, downloads, stamp=None):
+        entry = {"name": name, "format": "awq", "hidden_size": None,
+                 "release_date": "2026-01-01", "hf_downloads": downloads}
+        if stamp:
+            entry["_revalidated"] = stamp
+        return entry
+    recent = (today - datetime.timedelta(days=7)).isoformat()
+    expired = (today - datetime.timedelta(days=REVALIDATION_COOLDOWN_DAYS)).isoformat()
+    existing = [
+        awq("gone/popular-AWQ", 9_000_000, recent),   # failed last week
+        awq("gone/older-AWQ", 8_000_000, expired),    # cooldown over: retry
+        awq("new/candidate-AWQ", 10),
+        awq("bad/stamp-AWQ", 5, "not-a-date"),
+    ]
+    # Without the cooldown the two popular failures would take both slots.
+    assert select_retained_for_revalidation(existing, set(), 2, today=today) == [
+        "gone/older-AWQ", "new/candidate-AWQ"]
+    assert "gone/popular-AWQ" not in select_retained_for_revalidation(
+        existing, set(), 10, today=today)
+
+
+def test_unquantized_in_the_name_is_not_prequantized():
+    name = "google/gemma-3-1b-it-qat-int4-unquantized"
+    assert not is_prequantized_repo(name, None)
+    assert revalidation_priority({"name": name, "format": "gguf", "hidden_size": None,
+                                  "release_date": "2025-04-01"}) is None
+    # config.json still wins when it declares quantization outright.
+    assert is_prequantized_repo(name, {"quantization_config": {"quant_method": "awq"}})
+    assert is_prequantized_repo("org/model-int4", None)
+
+
 if __name__ == "__main__":
     tests = [
         test_preserves_architecture_when_config_fetch_misses,
@@ -410,6 +536,13 @@ if __name__ == "__main__":
         test_detects_moe_under_family_specific_key_names,
         test_arch_metadata_drops_unset_sentinels,
         test_param_estimate_sees_the_same_experts_as_detection,
+        test_revalidation_ranks_uncorrectable_packed_counts_first,
+        test_revalidation_flags_suspect_context_and_missing_date,
+        test_revalidation_selection_respects_budget_and_skips_fresh_entries,
+        test_packed_count_is_corrected_only_for_quantized_repos,
+        test_revalidation_keeps_the_retained_entry_on_a_sharp_parameter_drop,
+        test_revalidation_cooldown_stops_failures_holding_the_budget,
+        test_unquantized_in_the_name_is_not_prequantized,
     ]
     for fn in tests:
         fn()
