@@ -673,6 +673,59 @@ def test_negative_gguf_probe_budget_probes_nothing():
     assert probes.probed == []
 
 
+def test_list_valued_expert_counts_do_not_crash_or_leak():
+    # ERNIE-4.5-VL style: one entry per modality. This aborted the whole
+    # 2026-09-19 weekly scrape with "can only concatenate list".
+    ernie = {"hidden_size": 2560, "num_hidden_layers": 28, "vocab_size": 103424,
+             "num_attention_heads": 20, "num_key_value_heads": 4,
+             "moe_num_experts": [64, 64], "moe_top_k": [6, 6],
+             "moe_intermediate_size": [1536, 512]}
+    estimate = estimate_params_from_arch(ernie)
+    assert isinstance(estimate, int) and estimate > 1e9, estimate
+    assert correct_packed_param_count("org/ERNIE-VL-28B-A3B-AWQ", 5_000_000_000, ernie) > 5e9
+    moe = detect_moe("org/ERNIE-VL", ernie, "ernie4_5_moe_vl", 28_000_000_000)
+    assert moe["num_experts"] == 64 and moe["active_experts"] == 6, moe
+    # Empty lists, zeros and bools are not counts.
+    assert detect_moe("org/x", {"num_experts": [], "num_experts_per_tok": 0},
+                      "llama", 1_000)["is_moe"] is False
+
+
+def test_a_failing_estimate_keeps_the_reported_count():
+    saved = shm.estimate_params_from_arch
+    shm.estimate_params_from_arch = lambda config: [] + 1  # raises TypeError
+    try:
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            assert correct_packed_param_count(
+                "org/Odd-27B-AWQ", 7_000_000_000, {"hidden_size": 1}) == 7_000_000_000
+        assert "architecture estimate failed" in err.getvalue()
+    finally:
+        shm.estimate_params_from_arch = saved
+
+
+def test_malformed_text_config_does_not_abort():
+    # text_config: null makes the estimator call .get() on None.
+    with contextlib.redirect_stderr(io.StringIO()):
+        assert correct_packed_param_count(
+            "org/Odd-27B-AWQ", 7_000_000_000,
+            {"hidden_size": 5120, "text_config": None}) >= 7_000_000_000
+
+
+def test_one_broken_repo_is_skipped_not_fatal():
+    saved = shm._build_discovered_model
+    def boom(listing):
+        raise RuntimeError("unexpected config shape")
+    shm._build_discovered_model = boom
+    try:
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            assert shm._build_discovered_model_safely({"id": "org/broken"}) is None
+        assert "org/broken" in err.getvalue() and "RuntimeError" in err.getvalue()
+        # Counted, so a builder bug that breaks everything still fails the run.
+        assert shm.DISCOVERY_SKIPPED[-1] == "org/broken"
+        assert shm.DISCOVERY_SKIP_LIMIT < 100
+    finally:
+        shm._build_discovered_model = saved
+
+
 if __name__ == "__main__":
     tests = [
         test_preserves_architecture_when_config_fetch_misses,
@@ -710,6 +763,10 @@ if __name__ == "__main__":
         test_deferred_model_falls_back_to_its_expired_cache_entry,
         test_gguf_cache_is_saved_during_the_run_not_only_at_the_end,
         test_negative_gguf_probe_budget_probes_nothing,
+        test_list_valued_expert_counts_do_not_crash_or_leak,
+        test_a_failing_estimate_keeps_the_reported_count,
+        test_malformed_text_config_does_not_abort,
+        test_one_broken_repo_is_skipped_not_fatal,
     ]
     for fn in tests:
         fn()
