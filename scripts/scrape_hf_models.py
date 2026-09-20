@@ -1574,8 +1574,9 @@ def revalidation_priority(model: dict) -> int | None:
         return 0  # packed parameter count nothing has been able to correct
     if (model.get("context_length") or 0) > SUSPECT_CONTEXT_LENGTH:
         return 1
-    if not model.get("release_date"):
-        return 2
+    # A missing release_date is not a reason to re-fetch the whole record:
+    # backfill_release_dates() fills it at one request per model, with its
+    # own cache, and the two passes do not share bookkeeping.
     return None
 
 
@@ -2659,10 +2660,11 @@ def main():
              "(default: 1, which preserves current sequential behavior)."
     )
     parser.add_argument(
-        "--date-backfill-limit", type=int, default=2000,
+        "--date-backfill-limit", type=int, default=500,
         help="Max HuggingFace lookups per run to fill release_date on catalog "
-             "entries that have none (default: 2000, 0 disables). Results are "
-             "cached in data/release_date_cache.json so a killed run resumes."
+             "entries that have none (default: 500, one HF api window, 0 "
+             "disables). Results are cached in data/release_date_cache.json "
+             "so a killed run resumes."
     )
     args = parser.parse_args()
 

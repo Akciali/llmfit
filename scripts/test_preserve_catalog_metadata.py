@@ -414,12 +414,13 @@ def test_revalidation_ranks_uncorrectable_packed_counts_first():
     assert revalidation_priority(plain) is None
 
 
-def test_revalidation_flags_suspect_context_and_missing_date():
+def test_revalidation_flags_suspect_context_but_not_a_missing_date():
     base = {"name": "org/model", "format": "gguf", "hidden_size": 4096,
             "release_date": "2026-01-01", "context_length": 131072}
     assert revalidation_priority(base) is None
     assert revalidation_priority({**base, "context_length": 16777216}) == 1
-    assert revalidation_priority({**base, "release_date": None}) == 2
+    # The release-date backfill owns this gap at one request per model.
+    assert revalidation_priority({**base, "release_date": None}) is None
 
 
 def test_revalidation_selection_respects_budget_and_skips_fresh_entries():
@@ -434,10 +435,11 @@ def test_revalidation_selection_respects_budget_and_skips_fresh_entries():
     ]
     fresh = {"d/rescraped-AWQ"}
     # Priority beats popularity; downloads order entries within a priority.
+    # A dateless entry is left to the release-date backfill, however popular.
     assert select_retained_for_revalidation(existing, fresh, 2) == [
         "c/model-GPTQ", "b/model-AWQ"]
     assert select_retained_for_revalidation(existing, fresh, 10) == [
-        "c/model-GPTQ", "b/model-AWQ", "a/dateless-popular"]
+        "c/model-GPTQ", "b/model-AWQ"]
     assert select_retained_for_revalidation(existing, fresh, 0) == []
 
 
@@ -943,7 +945,7 @@ if __name__ == "__main__":
         test_arch_metadata_drops_unset_sentinels,
         test_param_estimate_sees_the_same_experts_as_detection,
         test_revalidation_ranks_uncorrectable_packed_counts_first,
-        test_revalidation_flags_suspect_context_and_missing_date,
+        test_revalidation_flags_suspect_context_but_not_a_missing_date,
         test_revalidation_selection_respects_budget_and_skips_fresh_entries,
         test_packed_count_is_rescued_by_the_architecture_estimate,
         test_hybrid_ssm_models_are_never_sized_by_the_estimator,
