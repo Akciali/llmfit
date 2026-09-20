@@ -14,6 +14,7 @@ Usage:
 import argparse
 import concurrent.futures
 import email.utils
+import http.client
 import json
 import os
 import re
@@ -1802,8 +1803,10 @@ def check_gguf_repo_exists(
     the canonical upstream). Repos without base_model tags are accepted as
     before (unverifiable).
 
-    Returns None when HuggingFace stayed rate limited after the retries: the
-    answer is unknown, and enrich_gguf_sources must not cache it as a miss.
+    Returns None when HuggingFace did not answer, for the candidate or for a
+    base_model lookup: rate limited after the retries, a 5xx, or a transport
+    failure. The answer is unknown, and enrich_gguf_sources must not cache
+    it as a miss.
     """
     url = f"{HF_API}/{repo_id}"
     try:
@@ -1827,9 +1830,12 @@ def check_gguf_repo_exists(
                     return abs(ratio - 1.0) <= _MIRROR_PARAMS_TOLERANCE
             return True
     except urllib.error.HTTPError as e:
-        if e.code == 429:
+        if e.code == 429 or e.code >= 500:
             return None
         return False
+    except (OSError, ValueError, http.client.HTTPException):
+        # HF did not answer: unknown, never cached as a miss
+        return None
     except Exception:
         return False
 
@@ -1840,7 +1846,7 @@ def _resolve_gguf_sources(
     """Resolve GGUF sources for a single model repo.
 
     Returns (sources, checks) where checks is [(candidate_repo, exists), ...]
-    and exists is None for a probe that stayed rate limited.
+    and exists is None for a probe HuggingFace did not answer.
     """
     sources: list[dict] = []
     checks: list[tuple[str, bool | None]] = []
