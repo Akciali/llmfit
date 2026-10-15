@@ -1051,18 +1051,144 @@ impl ModelProvider for MlxProvider {
 // llama.cpp provider (direct GGUF download from HuggingFace)
 // ---------------------------------------------------------------------------
 
+/// How a detected llama.cpp installation is invoked.
+///
+/// Classic builds install two binaries (`llama-cli`, `llama-server`). Newer
+/// builds ship a single `llama` binary that exposes the same tools as
+/// subcommands (`llama cli`, `llama serve`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LlamaCppBinaryStyle {
+    /// Classic separate `llama-cli` / `llama-server` binaries.
+    Separate,
+    /// Single `llama` binary; CLI and server modes are `llama cli` /
+    /// `llama serve`.
+    Omnibus,
+}
+
+impl LlamaCppBinaryStyle {
+    /// argv tokens selecting CLI mode for the detected binary.
+    pub fn cli_args(self) -> &'static [&'static str] {
+        match self {
+            Self::Separate => &[],
+            Self::Omnibus => &["cli"],
+        }
+    }
+
+    /// argv tokens selecting server mode for the detected binary.
+    pub fn server_args(self) -> &'static [&'static str] {
+        match self {
+            Self::Separate => &[],
+            Self::Omnibus => &["serve"],
+        }
+    }
+
+    /// Command name for CLI mode as a user would type it: `llama-cli` or
+    /// `llama cli`.
+    pub fn cli_command(self) -> &'static str {
+        match self {
+            Self::Separate => "llama-cli",
+            Self::Omnibus => "llama cli",
+        }
+    }
+
+    /// Short stable label used in JSON output.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Separate => "separate",
+            Self::Omnibus => "omnibus",
+        }
+    }
+}
+
+/// Pick the llama.cpp binaries to use and how to invoke them.
+///
+/// Classic names (`llama-cli` / `llama-server`) win when present so existing
+/// installs keep working unchanged; the single `llama` binary only fills in
+/// when no classic binary was found, and is then used for both modes.
+fn resolve_llamacpp_binaries(
+    legacy_cli: Option<String>,
+    legacy_server: Option<String>,
+    omnibus: Option<String>,
+) -> (Option<String>, Option<String>, LlamaCppBinaryStyle) {
+    if legacy_cli.is_some() || legacy_server.is_some() {
+        (legacy_cli, legacy_server, LlamaCppBinaryStyle::Separate)
+    } else {
+        match omnibus {
+            Some(bin) => (Some(bin.clone()), Some(bin), LlamaCppBinaryStyle::Omnibus),
+            None => (None, None, LlamaCppBinaryStyle::Separate),
+        }
+    }
+}
+
+/// Detect the llama.cpp binaries and their invocation style without probing
+/// for a running server.
+///
+/// The single `llama` binary is only looked up when no classic binary exists,
+/// and is only accepted if `llama cli --help` succeeds: other tools install a
+/// `llama` command too (e.g. Meta's llama-stack), and they reject `cli`.
+pub fn detect_llamacpp_binaries() -> (Option<String>, Option<String>, LlamaCppBinaryStyle) {
+    let legacy_cli = find_binary("llama-cli");
+    let legacy_server = find_binary("llama-server");
+    let omnibus = if legacy_cli.is_none() && legacy_server.is_none() {
+        find_binary("llama").filter(|bin| is_llamacpp_omnibus(bin))
+    } else {
+        None
+    };
+    resolve_llamacpp_binaries(legacy_cli, legacy_server, omnibus)
+}
+
+/// Whether `bin` is a llama.cpp omnibus build, i.e. accepts the `cli`
+/// subcommand.
+fn is_llamacpp_omnibus(bin: &str) -> bool {
+    is_llamacpp_omnibus_within(bin, std::time::Duration::from_secs(5))
+}
+
+/// [`is_llamacpp_omnibus`] with an explicit time limit. A `llama` command
+/// that has not exited by then is killed and treated as not llama.cpp, so a
+/// stuck or unrelated binary cannot stall startup.
+fn is_llamacpp_omnibus_within(bin: &str, timeout: std::time::Duration) -> bool {
+    let Ok(mut child) = std::process::Command::new(bin)
+        .args(["cli", "--help"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    }
+}
+
 /// A provider that downloads GGUF model files directly from HuggingFace
-/// and uses llama.cpp binaries (`llama-cli`, `llama-server`) to run them.
+/// and uses llama.cpp binaries to run them — either the classic
+/// `llama-cli` / `llama-server` pair or a single `llama` binary with
+/// `cli` / `serve` subcommands.
 ///
 /// Unlike Ollama, this doesn't require a running daemon — it downloads
 /// GGUF files to a local cache directory and invokes llama.cpp directly.
 pub struct LlamaCppProvider {
     /// Directory where GGUF models are stored.
     models_dir: PathBuf,
-    /// Path to llama-cli binary, if found.
+    /// Path to the binary used for CLI mode, if found.
     llama_cli: Option<String>,
-    /// Path to llama-server binary, if found.
+    /// Path to the binary used for server mode, if found.
     llama_server: Option<String>,
+    /// How the detected binaries must be invoked.
+    style: LlamaCppBinaryStyle,
     /// Whether a running llama-server was detected via health probe.
     server_running: bool,
 }
@@ -1070,8 +1196,7 @@ pub struct LlamaCppProvider {
 impl Default for LlamaCppProvider {
     fn default() -> Self {
         let models_dir = llamacpp_models_dir();
-        let llama_cli = find_binary("llama-cli");
-        let llama_server = find_binary("llama-server");
+        let (llama_cli, llama_server, style) = detect_llamacpp_binaries();
 
         // If no binaries found, check if a server is already running
         let server_running = if llama_cli.is_none() && llama_server.is_none() {
@@ -1085,6 +1210,7 @@ impl Default for LlamaCppProvider {
             models_dir,
             llama_cli,
             llama_server,
+            style,
             server_running,
         }
     }
@@ -1156,14 +1282,25 @@ impl LlamaCppProvider {
         Err(format!("Model file not found for '{}'", model_tag))
     }
 
-    /// Path to `llama-cli` if detected.
+    /// Path to the binary used for CLI mode (`llama-cli`, or `llama` for
+    /// omnibus installs). Invoke it with [`Self::binary_style`]'s `cli_args`
+    /// prepended.
     pub fn llama_cli_path(&self) -> Option<&str> {
         self.llama_cli.as_deref()
     }
 
-    /// Path to `llama-server` if detected.
+    /// Path to the binary used for server mode (`llama-server`, or `llama`
+    /// for omnibus installs). Invoke it with [`Self::binary_style`]'s
+    /// `server_args` prepended.
     pub fn llama_server_path(&self) -> Option<&str> {
         self.llama_server.as_deref()
+    }
+
+    /// How the detected binaries must be invoked: classic separate
+    /// `llama-cli` / `llama-server`, or a single `llama` binary with
+    /// `cli` / `serve` subcommands.
+    pub fn binary_style(&self) -> LlamaCppBinaryStyle {
+        self.style
     }
 
     /// Whether a running llama-server was detected via health probe.
@@ -4822,6 +4959,134 @@ pub fn tag_matches_model(tag: &str, hf_name: &str) -> bool {
     }
     stem_set.insert(stem);
     is_model_installed_llamacpp(hf_name, &stem_set)
+}
+
+#[cfg(test)]
+mod llamacpp_binary_tests {
+    use super::{LlamaCppBinaryStyle, resolve_llamacpp_binaries};
+
+    fn s(path: &str) -> Option<String> {
+        Some(path.to_string())
+    }
+
+    #[test]
+    fn classic_binaries_win_and_keep_separate_style() {
+        let (cli, server, style) = resolve_llamacpp_binaries(
+            s("/usr/local/bin/llama-cli"),
+            s("/usr/local/bin/llama-server"),
+            s("/home/u/.local/bin/llama"),
+        );
+
+        assert_eq!(cli.as_deref(), Some("/usr/local/bin/llama-cli"));
+        assert_eq!(server.as_deref(), Some("/usr/local/bin/llama-server"));
+        assert_eq!(style, LlamaCppBinaryStyle::Separate);
+        assert!(style.cli_args().is_empty());
+        assert!(style.server_args().is_empty());
+    }
+
+    #[test]
+    fn any_classic_binary_ignores_the_omnibus_one() {
+        // A mixed install resolves to the classic names only; the single
+        // `llama` binary is never invoked without its subcommands.
+        let (cli, server, style) = resolve_llamacpp_binaries(
+            s("/usr/local/bin/llama-cli"),
+            None,
+            s("/home/u/.local/bin/llama"),
+        );
+
+        assert_eq!(cli.as_deref(), Some("/usr/local/bin/llama-cli"));
+        assert_eq!(server, None);
+        assert_eq!(style, LlamaCppBinaryStyle::Separate);
+    }
+
+    #[test]
+    fn omnibus_binary_fills_both_modes_with_subcommands() {
+        let (cli, server, style) =
+            resolve_llamacpp_binaries(None, None, s("/home/u/.local/bin/llama"));
+
+        assert_eq!(cli.as_deref(), Some("/home/u/.local/bin/llama"));
+        assert_eq!(server.as_deref(), Some("/home/u/.local/bin/llama"));
+        assert_eq!(style, LlamaCppBinaryStyle::Omnibus);
+        assert_eq!(style.cli_args(), &["cli"]);
+        assert_eq!(style.server_args(), &["serve"]);
+    }
+
+    #[test]
+    fn nothing_found_reports_separate_unavailable() {
+        let (cli, server, style) = resolve_llamacpp_binaries(None, None, None);
+
+        assert_eq!(cli, None);
+        assert_eq!(server, None);
+        assert_eq!(style, LlamaCppBinaryStyle::Separate);
+    }
+
+    #[test]
+    fn style_labels_are_stable() {
+        assert_eq!(LlamaCppBinaryStyle::Separate.label(), "separate");
+        assert_eq!(LlamaCppBinaryStyle::Omnibus.label(), "omnibus");
+        assert_eq!(LlamaCppBinaryStyle::Separate.cli_command(), "llama-cli");
+        assert_eq!(LlamaCppBinaryStyle::Omnibus.cli_command(), "llama cli");
+    }
+
+    /// Fake `llama` commands for the `llama cli --help` check.
+    #[cfg(unix)]
+    mod omnibus_check {
+        use super::super::is_llamacpp_omnibus_within;
+        use std::os::unix::fs::PermissionsExt;
+        use std::path::PathBuf;
+        use std::time::{Duration, Instant};
+
+        /// Writes an executable shell script named `llama` into a fresh
+        /// per-test directory and returns its path.
+        fn fake_llama(test: &str, body: &str) -> PathBuf {
+            let dir = std::env::temp_dir().join(format!(
+                "llmfit-fake-llama-{}-{}",
+                std::process::id(),
+                test
+            ));
+            std::fs::create_dir_all(&dir).expect("create fake llama dir");
+            let path = dir.join("llama");
+            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("write fake llama");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .expect("make fake llama executable");
+            path
+        }
+
+        fn check(path: &std::path::Path, timeout: Duration) -> bool {
+            is_llamacpp_omnibus_within(path.to_str().expect("utf-8 temp path"), timeout)
+        }
+
+        #[test]
+        fn accepts_binary_that_answers_cli_help() {
+            // Only succeeds for exactly `llama cli --help`.
+            let llama = fake_llama(
+                "accepts",
+                r#"[ "$#" -eq 2 ] && [ "$1" = cli ] && [ "$2" = --help ]"#,
+            );
+            assert!(check(&llama, Duration::from_secs(5)));
+        }
+
+        #[test]
+        fn rejects_unrelated_llama_command() {
+            // Like llama-stack: an unknown `cli` subcommand is an error.
+            let llama = fake_llama("rejects", "echo \"unknown command: $1\" >&2; exit 2");
+            assert!(!check(&llama, Duration::from_secs(5)));
+        }
+
+        #[test]
+        fn hung_binary_times_out_as_not_llamacpp() {
+            let llama = fake_llama("hangs", "exec sleep 30");
+            let started = Instant::now();
+            assert!(!check(&llama, Duration::from_millis(200)));
+            assert!(started.elapsed() < Duration::from_secs(5));
+        }
+
+        #[test]
+        fn missing_binary_is_not_llamacpp() {
+            let missing = std::env::temp_dir().join("llmfit-no-such-llama-binary");
+            assert!(!check(&missing, Duration::from_secs(5)));
+        }
+    }
 }
 
 #[cfg(test)]
