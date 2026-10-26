@@ -1034,6 +1034,23 @@ def _migration_timestamp_reads_as_no_date(created_at: str) -> None:
     assert models[2]["release_date"] == "2022-03-02"
     assert stats["cleared"] == 1 and stats["deferred"] == 1
     assert store.cache["org/legacy"]["release_date"] is None
+    assert store.cache["org/same-day"]["not_migration"] is True
+    # The next run trusts the cache: only the deferred model is asked, the
+    # confirmed day is left alone and the cleared entry stays null.
+    script = [_http_error(_date_url("org/popular-undated"), 404)]
+    with _FakeHF(script) as hf, _DateCacheInMemory(store.cache) as store:
+        stats = shm.backfill_release_dates(models, limit=2, threads=1)
+    assert [u.split("/models/")[1].split("?")[0] for u in hf.requests] == [
+        "org/popular-undated"
+    ]
+    assert models[1]["release_date"] is None
+    assert models[2]["release_date"] == "2022-03-02"
+    assert stats["lookups"] == 1 and stats["filled"] == 0 and stats["cleared"] == 0
+    # An entry that lost its date gets the confirmed day back from the cache.
+    models[2]["release_date"] = None
+    with _FakeHF([]) as hf, _DateCacheInMemory(store.cache):
+        shm.backfill_release_dates(models, limit=2, threads=1)
+    assert hf.requests == [] and models[2]["release_date"] == "2022-03-02"
     # Fresh listings and model info go through the same exact match.
     assert shm.release_date_from_created_at(created_at) is None
     assert shm.release_date_from_created_at("2022-03-02T08:15:00.000Z") == "2022-03-02"

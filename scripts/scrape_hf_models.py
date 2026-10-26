@@ -2029,7 +2029,8 @@ def enrich_gguf_sources(models: list[dict], threads: int = 1,
 # the migration, not a release, so those two exact timestamps mean None.
 # The catalog and the cache keep the day only, so an entry stored on that
 # day is asked again, ahead of the undated ones, and cleared when HF
-# answers with one of the two timestamps.
+# answers with one of the two timestamps. A real creation that day is
+# marked in the cache once HF confirms it, and not asked again.
 
 HF_MIGRATION_CREATED_AT = frozenset(
     datetime(2022, 3, 2, 23, 29, second, tzinfo=timezone.utc) for second in (4, 5)
@@ -2119,7 +2120,7 @@ def fetch_release_date(repo_id: str) -> str | None:
 
 def backfill_release_dates(models: list[dict], limit: int, threads: int = 1) -> dict:
     """Fill release_date on entries that have none, and re-check the ones
-    stored on HF_MIGRATION_DAY. Mutates ``models``.
+    stored on HF_MIGRATION_DAY until HF confirms them. Mutates ``models``.
 
     Re-checks first, then most-downloaded first, since that is where the
     date sort is looked at.
@@ -2127,9 +2128,14 @@ def backfill_release_dates(models: list[dict], limit: int, threads: int = 1) -> 
     Returns the counters it prints, for the tests.
     """
     cache = _load_release_date_cache()
-    candidates = [
-        m for m in models if m.get("release_date") in (None, "", HF_MIGRATION_DAY)
-    ]
+
+    def _needs_lookup(model: dict) -> bool:
+        stored = model.get("release_date")
+        if stored == HF_MIGRATION_DAY:
+            return not cache.get(model["name"], {}).get("not_migration")
+        return not stored
+
+    candidates = [m for m in models if _needs_lookup(m)]
     candidates.sort(
         key=lambda m: (
             m.get("release_date") != HF_MIGRATION_DAY,
@@ -2157,7 +2163,7 @@ def backfill_release_dates(models: list[dict], limit: int, threads: int = 1) -> 
     for model in candidates:
         entry = cache.get(model["name"])
         cached = entry.get("release_date") if entry else None
-        if cached and cached != HF_MIGRATION_DAY:
+        if cached and (cached != HF_MIGRATION_DAY or entry.get("not_migration")):
             model["release_date"] = cached
             stats["filled"] += 1
             stats["from_cache"] += 1
@@ -2191,6 +2197,9 @@ def backfill_release_dates(models: list[dict], limit: int, threads: int = 1) -> 
                 "release_date": created,
                 "checked": datetime.now(timezone.utc).isoformat(),
             }
+            if created == HF_MIGRATION_DAY:
+                # Full timestamp seen and not the migration: a real date.
+                cache[model["name"]]["not_migration"] = True
             if created:
                 model["release_date"] = created
                 stats["filled"] += 1
