@@ -97,8 +97,9 @@ pub(crate) struct AmdSysfsCard {
     /// `mem_info_vram_total - mem_info_vram_used`, `None` when either is
     /// unreadable.
     pub free_vram_gb: Option<f64>,
-    /// PCIe lane widths from amdgpu sysfs, `None` when either width is
-    /// missing, malformed, zero, or outside the positive `u8` range.
+    /// PCIe lane widths of the card's slot from sysfs (see
+    /// `SystemSpecs::sysfs_pcie_link`), `None` when either width is missing,
+    /// malformed, zero, or outside the positive `u8` range.
     pub pcie_link: Option<PcieLink>,
 }
 
@@ -1137,27 +1138,7 @@ impl SystemSpecs {
                 }
             }
 
-            let read_width = |name: &str| {
-                std::fs::read_to_string(device_path.join(name))
-                    .ok()?
-                    .trim()
-                    .parse::<u8>()
-                    .ok()
-                    .filter(|width| *width > 0)
-            };
-            let pcie_link = match (
-                read_width("current_link_width"),
-                read_width("max_link_width"),
-            ) {
-                (Some(width), Some(max_width)) => Some(PcieLink {
-                    index: None,
-                    generation: None,
-                    width: Some(width),
-                    max_generation: None,
-                    max_width: Some(max_width),
-                }),
-                _ => None,
-            };
+            let pcie_link = Self::sysfs_pcie_link(&device_path);
 
             // Resolve this card's PCI slot so lspci yields a per-card name.
             let mut slot_hints: Vec<String> = Vec::new();
@@ -1181,6 +1162,65 @@ impl SystemSpecs {
         }
 
         cards
+    }
+
+    /// The PCIe lane widths of a GPU's slot, from sysfs. Cards that carry their
+    /// own PCIe switch (Navi 31 behind AMD's "Navi 10 XL" ports, for one) report
+    /// the switch's internal link in the GPU's own `current_link_width` and
+    /// `max_link_width`, so the link is read from the device right below the
+    /// root port on the GPU's path: the card's upstream switch port when it has
+    /// one, the GPU itself when it doesn't. A switch between the root port and
+    /// the card, such as a board-level one, is read instead of the card. Falls
+    /// back to the GPU's own files when that device can't be resolved or its
+    /// widths can't be read.
+    fn sysfs_pcie_link(gpu_dir: &std::path::Path) -> Option<PcieLink> {
+        Self::sysfs_device_below_root_port(gpu_dir)
+            .and_then(|dir| Self::read_sysfs_pcie_widths(&dir))
+            .or_else(|| Self::read_sysfs_pcie_widths(gpu_dir))
+    }
+
+    /// The device right below the root port on the canonical sysfs path of
+    /// `gpu_dir` (`/sys/devices/pci<domain>:<bus>/<root port>/<device>/...`).
+    /// `None` when the path doesn't resolve to a chain of PCI devices under a
+    /// root bus, or when the GPU sits on the root bus with no root port above.
+    fn sysfs_device_below_root_port(gpu_dir: &std::path::Path) -> Option<std::path::PathBuf> {
+        let gpu = std::fs::canonicalize(gpu_dir).ok()?;
+        let chain: Vec<&std::path::Path> = gpu.ancestors().collect();
+        let name = |dir: &std::path::Path| {
+            dir.file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_string)
+        };
+        let root_bus = chain
+            .iter()
+            .position(|dir| name(dir).is_some_and(|name| is_sysfs_pci_root_bus(&name)))?;
+        // chain[root_bus - 1] is the root port, chain[root_bus - 2] the device below it.
+        let below_root_port = root_bus.checked_sub(2)?;
+        chain[..root_bus]
+            .iter()
+            .all(|dir| name(dir).is_some_and(|name| is_sysfs_pci_address(&name)))
+            .then(|| chain[below_root_port].to_path_buf())
+    }
+
+    /// `current_link_width` and `max_link_width` of a sysfs PCI device, `None`
+    /// when either is missing, malformed, zero, or outside the positive `u8`
+    /// range.
+    fn read_sysfs_pcie_widths(dir: &std::path::Path) -> Option<PcieLink> {
+        let read_width = |name: &str| {
+            std::fs::read_to_string(dir.join(name))
+                .ok()?
+                .trim()
+                .parse::<u8>()
+                .ok()
+                .filter(|width| *width > 0)
+        };
+        Some(PcieLink {
+            index: None,
+            generation: None,
+            width: Some(read_width("current_link_width")?),
+            max_generation: None,
+            max_width: Some(read_width("max_link_width")?),
+        })
     }
 
     /// Group sysfs AMD cards by model name and drop integrated GPUs when a
@@ -2957,6 +2997,34 @@ impl SystemSpecs {
     }
 }
 
+/// A sysfs PCI root bus directory name, `pci<domain>:<bus>` (`pci0000:00`;
+/// VMD domains have five hex digits).
+fn is_sysfs_pci_root_bus(name: &str) -> bool {
+    name.strip_prefix("pci")
+        .and_then(|rest| rest.split_once(':'))
+        .is_some_and(|(domain, bus)| is_pci_domain(domain) && is_hex_of_len(bus, 2))
+}
+
+/// A sysfs PCI device directory name, `<domain>:<bus>:<device>.<function>`
+/// (`0000:03:00.0`).
+fn is_sysfs_pci_address(name: &str) -> bool {
+    let Some((address, function)) = name.rsplit_once('.') else {
+        return false;
+    };
+    let parts: Vec<&str> = address.split(':').collect();
+    matches!(parts.as_slice(), [domain, bus, device]
+        if is_pci_domain(domain) && is_hex_of_len(bus, 2) && is_hex_of_len(device, 2))
+        && is_hex_of_len(function, 1)
+}
+
+fn is_pci_domain(part: &str) -> bool {
+    part.len() >= 4 && part.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+fn is_hex_of_len(part: &str, len: usize) -> bool {
+    part.len() == len && part.chars().all(|c| c.is_ascii_hexdigit())
+}
+
 /// `nvidia-smi --query-gpu` fields for [`PcieLink`]. The name goes last
 /// because it can contain commas.
 pub const NVIDIA_SMI_PCIE_QUERY: &str = "--query-gpu=index,pcie.link.gen.current,pcie.link.width.current,pcie.link.gen.max,pcie.link.width.max,name";
@@ -4703,6 +4771,237 @@ mod tests {
             .expect("missing-width AMD group");
         assert_eq!(missing.count, 2);
         assert!(missing.pcie_links.is_empty());
+    }
+
+    /// A fresh directory for a sysfs tree built at test time. PCI names
+    /// contain `:`, which Windows does not allow in file names, so these trees
+    /// can't be committed fixtures.
+    #[cfg(unix)]
+    fn pcie_tree_root(test: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "llmfit-test-{test}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    /// Sysfs directory names from the root bus down to the GPU, each with its
+    /// `(current_link_width, max_link_width)` when it has one.
+    #[cfg(unix)]
+    type PcieTreePath<'a> = [(&'a str, Option<(&'a str, &'a str)>)];
+
+    /// Lay out one AMD card the way sysfs does: `devices/<path...>` with each
+    /// device's `(current_link_width, max_link_width)`, the GPU last, and
+    /// `drm/<card>/device` as a symlink to the GPU.
+    #[cfg(unix)]
+    fn pcie_tree_card(root: &std::path::Path, card: &str, path: &PcieTreePath<'_>) {
+        let mut dir = root.join("devices");
+        for (name, widths) in path {
+            dir = dir.join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            if let Some((current, max)) = widths {
+                std::fs::write(dir.join("current_link_width"), current).unwrap();
+                std::fs::write(dir.join("max_link_width"), max).unwrap();
+            }
+        }
+        std::fs::write(dir.join("vendor"), "0x1002").unwrap();
+        std::fs::write(dir.join("mem_info_vram_total"), "25753026560").unwrap();
+        let card_dir = root.join("drm").join(card);
+        std::fs::create_dir_all(&card_dir).unwrap();
+        std::os::unix::fs::symlink(&dir, card_dir.join("device")).unwrap();
+    }
+
+    /// The (width, max width) pairs of every card, sorted.
+    #[cfg(unix)]
+    fn pcie_widths(gpus: &[GpuInfo]) -> Vec<(Option<u8>, Option<u8>)> {
+        let mut widths: Vec<_> = gpus
+            .iter()
+            .flat_map(|gpu| gpu.pcie_links.iter().map(|l| (l.width, l.max_width)))
+            .collect();
+        widths.sort_unstable();
+        widths
+    }
+
+    // Four Navi 31 cards behind their on-card switch (root port, upstream
+    // port, downstream port, GPU) in slots wired x4, x16, x16 and x8. The GPU
+    // reads 16/16 on every card; the slot link is on the upstream port.
+    #[cfg(unix)]
+    #[test]
+    fn amd_sysfs_reads_slot_link_above_on_card_switch() {
+        let root = pcie_tree_root("amd-pcie-on-card-switch");
+        let full = Some(("16", "16"));
+        // (card, root bus, root port, lanes wired to the slot, card's first bus)
+        for (card, bus, root_port, slot, base) in [
+            ("card0", "pci0000:00", "0000:00:1b.4", "4", 0x02),
+            ("card1", "pci0000:16", "0000:16:00.0", "16", 0x17),
+            ("card2", "pci0000:64", "0000:64:00.0", "16", 0x65),
+            ("card3", "pci0000:b2", "0000:b2:00.0", "8", 0xb3),
+        ] {
+            let upstream = format!("0000:{base:02x}:00.0");
+            let downstream = format!("0000:{:02x}:00.0", base + 1);
+            let gpu = format!("0000:{:02x}:00.0", base + 2);
+            pcie_tree_card(
+                &root,
+                card,
+                &[
+                    (bus, None),
+                    (root_port, Some((slot, slot))),
+                    (upstream.as_str(), Some((slot, "16"))),
+                    (downstream.as_str(), full),
+                    (gpu.as_str(), full),
+                ],
+            );
+        }
+
+        let gpus = SystemSpecs::detect_amd_gpu_sysfs_info_from_root(&root.join("drm"), |_, _| {
+            Some("AMD Radeon RX 7900 XTX".to_string())
+        });
+        std::fs::remove_dir_all(&root).unwrap();
+
+        assert_eq!(gpus.len(), 1);
+        assert_eq!(gpus[0].count, 4);
+        assert_eq!(
+            pcie_widths(&gpus),
+            vec![
+                (Some(4), Some(16)),
+                (Some(8), Some(16)),
+                (Some(16), Some(16)),
+                (Some(16), Some(16)),
+            ]
+        );
+    }
+
+    // `llmfit doctor` prints `narrowed_pcie_warnings`. A card behind an
+    // on-card switch in a slot wired x4 used to read x16 of x16 from the GPU
+    // and gave no warning.
+    #[cfg(unix)]
+    #[test]
+    fn doctor_warns_on_narrowed_slot_behind_on_card_switch() {
+        let root = pcie_tree_root("amd-pcie-doctor-warning");
+        pcie_tree_card(
+            &root,
+            "card0",
+            &[
+                ("pci0000:00", None),
+                ("0000:00:1b.4", Some(("4", "4"))),
+                ("0000:02:00.0", Some(("4", "16"))),
+                ("0000:03:00.0", Some(("16", "16"))),
+                ("0000:04:00.0", Some(("16", "16"))),
+            ],
+        );
+
+        let gpus = SystemSpecs::detect_amd_gpu_sysfs_info_from_root(&root.join("drm"), |_, _| {
+            Some("AMD Radeon RX 7900 XTX".to_string())
+        });
+        std::fs::remove_dir_all(&root).unwrap();
+
+        let specs = SystemSpecs {
+            gpus,
+            ..make_specs_no_gpu()
+        };
+        assert_eq!(
+            specs.narrowed_pcie_warnings(),
+            vec![
+                "AMD Radeon RX 7900 XTX reports PCIe x4; the card supports x16. \
+                 AMD links can drop at idle; re-check under load before drawing conclusions about slot wiring."
+            ]
+        );
+    }
+
+    // Without an on-card switch the GPU is the device below the root port and
+    // its own link is the slot link; the root port's widths are not used.
+    // When the device below the root port can't be found or has no readable
+    // widths, the GPU's own files are read as before.
+    #[cfg(unix)]
+    #[test]
+    fn amd_sysfs_reads_gpu_link_without_switch_and_falls_back_to_it() {
+        let gpu = Some(("8", "16"));
+        let cases: [(&str, &PcieTreePath<'_>); 5] = [
+            (
+                "no-switch",
+                &[
+                    ("pci0000:00", None),
+                    ("0000:00:01.1", Some(("8", "8"))),
+                    ("0000:01:00.0", gpu),
+                ],
+            ),
+            (
+                "on-root-bus",
+                &[("pci0000:00", None), ("0000:00:02.0", gpu)],
+            ),
+            (
+                "below-root-port-without-widths",
+                &[
+                    ("pci0000:00", None),
+                    ("0000:00:01.1", Some(("16", "16"))),
+                    ("0000:01:00.0", None),
+                    ("0000:02:00.0", Some(("16", "16"))),
+                    ("0000:03:00.0", gpu),
+                ],
+            ),
+            (
+                "non-pci-directory-on-path",
+                &[
+                    ("pci0000:00", None),
+                    ("0000:00:01.1", Some(("16", "16"))),
+                    ("bridge", Some(("16", "16"))),
+                    ("0000:03:00.0", gpu),
+                ],
+            ),
+            ("no-root-bus", &[("platform", None), ("0000:03:00.0", gpu)]),
+        ];
+
+        let root = pcie_tree_root("amd-pcie-fallback");
+        let mut observed = Vec::new();
+        for (case, path) in cases {
+            let case_root = root.join(case);
+            pcie_tree_card(&case_root, "card0", path);
+            let gpus =
+                SystemSpecs::detect_amd_gpu_sysfs_info_from_root(&case_root.join("drm"), |_, _| {
+                    Some("AMD Radeon RX 6600".to_string())
+                });
+            observed.push((case, pcie_widths(&gpus)));
+        }
+        std::fs::remove_dir_all(&root).unwrap();
+
+        for (case, widths) in observed {
+            assert_eq!(widths, vec![(Some(8), Some(16))], "{case}");
+        }
+    }
+
+    #[test]
+    fn sysfs_pci_names_are_recognised() {
+        use super::{is_sysfs_pci_address, is_sysfs_pci_root_bus};
+
+        for name in ["pci0000:00", "pci0000:b2", "pci10000:e0"] {
+            assert!(is_sysfs_pci_root_bus(name), "{name}");
+        }
+        for name in [
+            "pci0000",
+            "pci000:00",
+            "pci0000:0",
+            "pcix0000:00",
+            "0000:00",
+            "pci0000:zz",
+        ] {
+            assert!(!is_sysfs_pci_root_bus(name), "{name}");
+        }
+        for name in ["0000:03:00.0", "0000:00:1b.4", "10000:e1:00.0"] {
+            assert!(is_sysfs_pci_address(name), "{name}");
+        }
+        for name in [
+            "0000:03:00",
+            "000:03:00.0",
+            "0000:3:00.0",
+            "0000:03:00.10",
+            "card0",
+            "pci0000:00",
+        ] {
+            assert!(!is_sysfs_pci_address(name), "{name}");
+        }
     }
 
     #[test]
